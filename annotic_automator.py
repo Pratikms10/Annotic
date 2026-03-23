@@ -378,78 +378,81 @@ async def click_add_segment(page, is_first=False):
         initial_count = await container.locator('> div').count()
         
         if is_first or initial_count == 0:
-            print("  [INFO] First segment: simulating human-speed mouse drag on timeline...")
+            print("  [INFO] First segment: simulating human-speed mouse drag on bottom waveform...")
             
+            # ── Find the BOTTOM-MOST canvas (the actual waveform at the bottom of the page) ──
             canvases = page.locator('canvas')
             num_canvases = await canvases.count()
             if num_canvases == 0:
-                print("  [ERROR] Could not find any timeline canvas to drag on!")
+                print("  [ERROR] Could not find any canvas elements!")
                 return False
-                
-            success = False
+            
+            # Collect all canvas bounding boxes and pick the one closest to the bottom
+            canvas_boxes = []
             for idx in range(num_canvases):
-                waveform = canvases.nth(idx)
-                box = await waveform.bounding_box()
-                if not box or box['width'] < 100 or box['height'] < 20: 
-                    continue
-                    
-                # Drag from ~10% to ~40% of the waveform width (a moderate partial drag)
-                start_x = box['x'] + (box['width'] * 0.1)
-                end_x   = box['x'] + (box['width'] * 0.4)
+                c = canvases.nth(idx)
+                b = await c.bounding_box()
+                if b and b['width'] > 50 and b['height'] > 10:
+                    canvas_boxes.append((idx, b))
+                    print(f"    [SCAN] Canvas {idx}: x={b['x']:.0f} y={b['y']:.0f} w={b['width']:.0f} h={b['height']:.0f}")
+            
+            if not canvas_boxes:
+                print("  [ERROR] No usable canvas found!")
+                return False
+            
+            # Sort by Y position descending — bottom-most first
+            canvas_boxes.sort(key=lambda item: item[1]['y'], reverse=True)
+            
+            success = False
+            for idx, box in canvas_boxes:
+                print(f"    [TARGET] Using canvas {idx} at Y={box['y']:.0f} (bottom-most)")
                 
-                win_width = await page.evaluate("window.innerWidth")
-                if end_x > win_width - 10: end_x = win_width - 20
+                # Drag from ~5% to ~30% of the canvas width (partial drag like the green rectangle in screenshot)
+                start_x = box['x'] + (box['width'] * 0.05)
+                end_x   = box['x'] + (box['width'] * 0.30)
                 
                 drag_distance = end_x - start_x
                 
-                # Try different Y heights to find the interactive region
-                y_offsets = [
-                    box['y'] - 20,                  # Ruler above waveform
-                    box['y'] + 5,                   # Canvas top edge
-                    box['y'] + box['height'] * 0.25, # Upper quarter
-                    box['y'] + box['height'] * 0.5,  # Canvas center
-                    box['y'] + box['height'] - 5     # Canvas bottom edge
-                ]
+                # Drag at the vertical CENTER of this canvas
+                y = box['y'] + (box['height'] * 0.5)
                 
-                for y in y_offsets:
-                    if y < 0: continue
-                    print(f"    -> Human-speed drag at Y={y:.1f} from X={start_x:.0f} to X={end_x:.0f}...")
-                    
-                    # ── HUMAN-LIKE DRAG: slow, stepped, realistic ──
-                    
-                    # 1. Move to starting position (like hovering the cursor there)
-                    await page.mouse.move(start_x, y)
-                    await page.wait_for_timeout(200)  # Pause before clicking
-                    
-                    # 2. Press mouse down and hold briefly (human reaction)
-                    await page.mouse.down()
-                    await page.wait_for_timeout(150)  # Hold down before moving
-                    
-                    # 3. Drag slowly across in small increments (~5-8px steps, 30-50ms between)
-                    num_steps = 40
-                    step_size = drag_distance / num_steps
-                    current_x = start_x
-                    
-                    for step in range(num_steps):
-                        current_x += step_size
-                        await page.mouse.move(current_x, y)
-                        await page.wait_for_timeout(35)  # ~35ms between each micro-move
-                    
-                    # 4. Small pause at end position (human hesitation before releasing)
-                    await page.wait_for_timeout(200)
-                    
-                    # 5. Release mouse
-                    await page.mouse.up()
-                    
-                    # 6. Wait for UI to react
-                    await page.wait_for_timeout(1000)
-                    
-                    if await container.locator('> div').count() > initial_count:
-                        print(f"  [SUCCESS] Created segment by sliding timeline at Y={y:.1f}!")
-                        success = True
-                        break
+                print(f"    -> Human-speed drag at Y={y:.1f} from X={start_x:.0f} to X={end_x:.0f}...")
                 
-                if success: break
+                # ── HUMAN-LIKE DRAG: slow, stepped, realistic ──
+                
+                # 1. Move to starting position (hovering)
+                await page.mouse.move(start_x, y)
+                await page.wait_for_timeout(300)
+                
+                # 2. Press mouse down and hold briefly
+                await page.mouse.down()
+                await page.wait_for_timeout(200)
+                
+                # 3. Drag slowly in small increments
+                num_steps = 50
+                step_size = drag_distance / num_steps
+                current_x = start_x
+                
+                for step in range(num_steps):
+                    current_x += step_size
+                    await page.mouse.move(current_x, y)
+                    await page.wait_for_timeout(30)
+                
+                # 4. Pause at end position
+                await page.wait_for_timeout(300)
+                
+                # 5. Release mouse
+                await page.mouse.up()
+                
+                # 6. Wait for UI to react
+                await page.wait_for_timeout(1500)
+                
+                if await container.locator('> div').count() > initial_count:
+                    print(f"  [SUCCESS] Created segment by dragging on bottom waveform canvas {idx}!")
+                    success = True
+                    break
+                else:
+                    print(f"    [INFO] No segment appeared on canvas {idx}, trying next...")
             
             if not success:
                 print("  [ERROR] Dragged on all canvases but no segment appeared!")
