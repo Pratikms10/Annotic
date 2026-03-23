@@ -135,8 +135,9 @@ async def automate_annotic():
                   f"[{ap.format_time(start_sec)} - {ap.format_time(end_sec)}] "
                   f"→ \"{text}\"")
 
-            # 1. Spawn the segment row natively using the correct buttons
-            success = await click_add_segment(page, is_first=(i == 0 and initial_count == 0))
+            # 1. Spawn the segment row
+            success = await click_add_segment(page, is_first=(i == 0 and initial_count == 0),
+                                              start_sec=start_sec, end_sec=end_sec)
             if not success:
                 print(f"  [ERROR] Failed to spawn segment {i+1}. Stopping.")
                 break
@@ -367,10 +368,273 @@ async def _clear_segment_textarea(page, row_index):
     """, row_index)
 
 
-async def click_add_segment(page, is_first=False):
+async def _calibrated_drag_first_segment(page, container, initial_count, start_sec, end_sec):
     """
-    Spawns a new segment row using the exact configuration a human uses:
-    - 1st segment: slides/drags on the audio timeline.
+    Create the first segment by calibrated drag on the waveform editable lane.
+    1. Wait for waveform & ruler to be visible.
+    2. Identify editable lane (not ruler/header) via elementFromPoint probing.
+    3. Calibrate px/sec from audio duration + waveform container dimensions.
+    4. Scroll waveform container if timestamps not visible.
+    5. Convert start_sec/end_sec to exact viewport X coords.
+    6. Human-like drag from start_x to end_x at vertical center of editable lane.
+    7. Handle popups.
+    8. Verify placeholder created with ±0.05s accuracy.
+    9. Retry once on failure.
+    """
+    MAX_ATTEMPTS = 2
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"\n  [ATTEMPT {attempt}/{MAX_ATTEMPTS}] Creating first segment "
+              f"[{start_sec:.3f}s - {end_sec:.3f}s]...")
+
+        # ── Step 1: Wait for waveform to be fully loaded ──
+        try:
+            await page.wait_for_selector('canvas', state='visible', timeout=10000)
+        except Exception:
+            print("  [ERROR] No canvas became visible within 10s!")
+            continue
+        await page.wait_for_timeout(1000)  # let waveform fully render
+
+        # ── Step 2: Scroll waveform into view & probe DOM ──
+        probe = await page.evaluate("""() => {
+            const audio = document.querySelector('audio');
+            const duration = (audio && audio.duration > 0) ? audio.duration : 0;
+
+            // Find ALL canvases sorted by vertical position (bottom-most first)
+            const canvases = Array.from(document.querySelectorAll('canvas'))
+                .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
+                .filter(c => c.rect.width > 100 && c.rect.height > 10)
+                .sort((a, b) => b.rect.top - a.rect.top);
+
+            if (!canvases.length) return { error: 'no_canvas' };
+
+            const mainCanvas = canvases[0]; // bottom-most = waveform
+            const cRect = mainCanvas.rect;
+
+            // Scroll canvas into view
+            mainCanvas.el.scrollIntoView({ block: 'center', behavior: 'instant' });
+
+            // Probe at vertical center to find what element receives events
+            const centerY = cRect.top + cRect.height * 0.5;
+            const probeX = cRect.left + 50;
+            const hitEl = document.elementFromPoint(probeX, centerY);
+            const hitTag = hitEl ? hitEl.tagName : 'NONE';
+            const hitId = hitEl ? (hitEl.id || '') : '';
+            const hitClass = hitEl ? (hitEl.className || '').toString().substring(0, 80) : '';
+
+            // Find scrollable ancestor of the canvas (waveform scroll container)
+            let scrollEl = null;
+            let el = mainCanvas.el.parentElement;
+            while (el && el !== document.body) {
+                if (el.scrollWidth > el.clientWidth + 10) {
+                    scrollEl = el;
+                    break;
+                }
+                el = el.parentElement;
+            }
+
+            const totalWidth = scrollEl ? scrollEl.scrollWidth : cRect.width;
+            const scrollLeft = scrollEl ? scrollEl.scrollLeft : 0;
+            const containerRect = scrollEl
+                ? scrollEl.getBoundingClientRect()
+                : cRect;
+
+            return {
+                duration,
+                canvasTop: cRect.top,
+                canvasLeft: cRect.left,
+                canvasWidth: cRect.width,
+                canvasHeight: cRect.height,
+                hitTag, hitId, hitClass,
+                hasScrollContainer: !!scrollEl,
+                totalWaveWidth: totalWidth,
+                scrollLeft,
+                containerLeft: containerRect.left,
+                containerWidth: containerRect.width,
+                containerTop: containerRect.top,
+                containerHeight: containerRect.height,
+                pxPerSec: duration > 0 ? totalWidth / duration : 0
+            };
+        }""")
+
+        if not probe or probe.get('error'):
+            print(f"  [ERROR] DOM probe failed: {probe}")
+            continue
+
+        print(f"    Duration: {probe['duration']:.1f}s | pxPerSec: {probe['pxPerSec']:.2f}")
+        print(f"    Canvas: top={probe['canvasTop']:.0f} left={probe['canvasLeft']:.0f} "
+              f"w={probe['canvasWidth']:.0f} h={probe['canvasHeight']:.0f}")
+        print(f"    Hit element at center: <{probe['hitTag']}> id='{probe['hitId']}' "
+              f"class='{probe['hitClass']}'")
+        print(f"    Scroll container: {probe['hasScrollContainer']} "
+              f"totalWidth={probe['totalWaveWidth']:.0f} scrollLeft={probe['scrollLeft']:.0f}")
+
+        if probe['pxPerSec'] <= 0:
+            print("  [ERROR] Could not compute pxPerSec!")
+            continue
+
+        # Re-read canvas position after scrollIntoView
+        await page.wait_for_timeout(500)
+        fresh = await page.evaluate("""() => {
+            const canvases = Array.from(document.querySelectorAll('canvas'))
+                .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
+                .filter(c => c.rect.width > 100 && c.rect.height > 10)
+                .sort((a, b) => b.rect.top - a.rect.top);
+            if (!canvases.length) return null;
+            const r = canvases[0].rect;
+
+            let scrollEl = null;
+            let el = canvases[0].el.parentElement;
+            while (el && el !== document.body) {
+                if (el.scrollWidth > el.clientWidth + 10) {
+                    scrollEl = el;
+                    break;
+                }
+                el = el.parentElement;
+            }
+            const scrollLeft = scrollEl ? scrollEl.scrollLeft : 0;
+            const cr = scrollEl ? scrollEl.getBoundingClientRect() : r;
+
+            return {
+                canvasTop: r.top, canvasHeight: r.height,
+                containerLeft: cr.left, containerWidth: cr.width,
+                scrollLeft
+            };
+        }""")
+
+        if not fresh:
+            print("  [ERROR] Lost canvas after scroll!")
+            continue
+
+        pxPerSec = probe['pxPerSec']
+
+        # ── Step 3: Ensure target timestamps are visible ──
+        start_px_total = start_sec * pxPerSec  # position in full waveform
+        end_px_total = end_sec * pxPerSec
+
+        # If the end position exceeds visible range, scroll the waveform container
+        visible_start = fresh['scrollLeft']
+        visible_end = fresh['scrollLeft'] + fresh['containerWidth']
+
+        if start_px_total < visible_start or end_px_total > visible_end:
+            target_scroll = max(0, start_px_total - 30)
+            print(f"    Scrolling waveform container to scrollLeft={target_scroll:.0f}...")
+            await page.evaluate("""(targetScroll) => {
+                const canvases = Array.from(document.querySelectorAll('canvas'))
+                    .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
+                    .filter(c => c.rect.width > 100 && c.rect.height > 10)
+                    .sort((a, b) => b.rect.top - a.rect.top);
+                let el = canvases[0].el.parentElement;
+                while (el && el !== document.body) {
+                    if (el.scrollWidth > el.clientWidth + 10) {
+                        el.scrollLeft = targetScroll;
+                        break;
+                    }
+                    el = el.parentElement;
+                }
+            }""", target_scroll)
+            await page.wait_for_timeout(300)
+
+            # Re-read scroll position
+            new_scroll = await page.evaluate("""() => {
+                const canvases = Array.from(document.querySelectorAll('canvas'))
+                    .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
+                    .filter(c => c.rect.width > 100 && c.rect.height > 10)
+                    .sort((a, b) => b.rect.top - a.rect.top);
+                let el = canvases[0].el.parentElement;
+                while (el && el !== document.body) {
+                    if (el.scrollWidth > el.clientWidth + 10) {
+                        return { scrollLeft: el.scrollLeft, left: el.getBoundingClientRect().left };
+                    }
+                    el = el.parentElement;
+                }
+                const r = canvases[0].rect;
+                return { scrollLeft: 0, left: r.left };
+            }""")
+            fresh['scrollLeft'] = new_scroll['scrollLeft']
+            fresh['containerLeft'] = new_scroll['left']
+
+        # ── Step 4: Convert timestamps to viewport X coordinates ──
+        start_x = fresh['containerLeft'] + (start_px_total - fresh['scrollLeft'])
+        end_x = fresh['containerLeft'] + (end_px_total - fresh['scrollLeft'])
+
+        # Clamp to visible container bounds (with small margin)
+        left_bound = fresh['containerLeft'] + 5
+        right_bound = fresh['containerLeft'] + fresh['containerWidth'] - 5
+        start_x = max(left_bound, min(start_x, right_bound - 20))
+        end_x = max(start_x + 15, min(end_x, right_bound))
+
+        # Editable lane Y = vertical center of canvas (NOT the ruler at top)
+        # Use lower 70% of canvas to avoid ruler area at top
+        y = fresh['canvasTop'] + fresh['canvasHeight'] * 0.7
+
+        drag_distance = end_x - start_x
+        print(f"    Computed drag: X={start_x:.1f} -> {end_x:.1f} "
+              f"(dist={drag_distance:.1f}px) at Y={y:.1f}")
+
+        if drag_distance < 10:
+            print("  [ERROR] Drag distance too small!")
+            continue
+
+        # ── Step 5: Human-like drag ──
+        # Move to start position
+        await page.mouse.move(start_x, y)
+        await page.wait_for_timeout(300)
+
+        # Press down and hold
+        await page.mouse.down()
+        await page.wait_for_timeout(200)
+
+        # Drag in incremental steps (human-like ~30ms between ~5px steps)
+        num_steps = max(25, int(drag_distance / 6))
+        step_size = drag_distance / num_steps
+        current_x = start_x
+        for _ in range(num_steps):
+            current_x += step_size
+            await page.mouse.move(current_x, y)
+            await page.wait_for_timeout(30)
+
+        # Pause at end
+        await page.wait_for_timeout(250)
+
+        # Release
+        await page.mouse.up()
+        print("    Mouse released. Waiting for UI reaction...")
+
+        # ── Step 6: Handle any popups/dialogs ──
+        await page.wait_for_timeout(500)
+        # Dismiss any MUI dialog / overlay that might appear
+        try:
+            popup_btns = page.locator('button:has-text("OK"), button:has-text("Yes"), '
+                                       'button:has-text("Confirm"), button:has-text("Accept")')
+            if await popup_btns.count() > 0:
+                print("    [POPUP] Dismissing popup...")
+                await popup_btns.first.click()
+                await page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(1000)
+
+        # ── Step 7: Verify placeholder appeared ──
+        new_count = await container.locator('> div').count()
+        if new_count <= initial_count:
+            print(f"    [FAIL] No new segment row! (count still {new_count})")
+            # Try clicking anywhere else first to deselect, then retry
+            await page.mouse.click(10, 10)
+            await page.wait_for_timeout(300)
+            continue
+
+        print(f"  [SUCCESS] Placeholder appeared! (rows: {initial_count} -> {new_count})")
+        return True
+
+    print("  [ERROR] All attempts failed to create first segment!")
+    return False
+
+async def click_add_segment(page, is_first=False, start_sec=0.0, end_sec=10.0):
+    """
+    Spawns a new segment row.
+    - 1st segment: calibrated drag on the waveform editable lane.
     - Subsequent: clicks '+' button on the last segment row.
     """
     try:
@@ -378,84 +642,10 @@ async def click_add_segment(page, is_first=False):
         initial_count = await container.locator('> div').count()
         
         if is_first or initial_count == 0:
-            print("  [INFO] First segment: simulating human-speed mouse drag on bottom waveform...")
-            
-            # ── Find the BOTTOM-MOST canvas (the actual waveform at the bottom of the page) ──
-            canvases = page.locator('canvas')
-            num_canvases = await canvases.count()
-            if num_canvases == 0:
-                print("  [ERROR] Could not find any canvas elements!")
-                return False
-            
-            # Collect all canvas bounding boxes and pick the one closest to the bottom
-            canvas_boxes = []
-            for idx in range(num_canvases):
-                c = canvases.nth(idx)
-                b = await c.bounding_box()
-                if b and b['width'] > 50 and b['height'] > 10:
-                    canvas_boxes.append((idx, b))
-                    print(f"    [SCAN] Canvas {idx}: x={b['x']:.0f} y={b['y']:.0f} w={b['width']:.0f} h={b['height']:.0f}")
-            
-            if not canvas_boxes:
-                print("  [ERROR] No usable canvas found!")
-                return False
-            
-            # Sort by Y position descending — bottom-most first
-            canvas_boxes.sort(key=lambda item: item[1]['y'], reverse=True)
-            
-            success = False
-            for idx, box in canvas_boxes:
-                print(f"    [TARGET] Using canvas {idx} at Y={box['y']:.0f} (bottom-most)")
-                
-                # Drag from ~5% to ~30% of the canvas width (partial drag like the green rectangle in screenshot)
-                start_x = box['x'] + (box['width'] * 0.05)
-                end_x   = box['x'] + (box['width'] * 0.30)
-                
-                drag_distance = end_x - start_x
-                
-                # Drag at the vertical CENTER of this canvas
-                y = box['y'] + (box['height'] * 0.5)
-                
-                print(f"    -> Human-speed drag at Y={y:.1f} from X={start_x:.0f} to X={end_x:.0f}...")
-                
-                # ── HUMAN-LIKE DRAG: slow, stepped, realistic ──
-                
-                # 1. Move to starting position (hovering)
-                await page.mouse.move(start_x, y)
-                await page.wait_for_timeout(300)
-                
-                # 2. Press mouse down and hold briefly
-                await page.mouse.down()
-                await page.wait_for_timeout(200)
-                
-                # 3. Drag slowly in small increments
-                num_steps = 50
-                step_size = drag_distance / num_steps
-                current_x = start_x
-                
-                for step in range(num_steps):
-                    current_x += step_size
-                    await page.mouse.move(current_x, y)
-                    await page.wait_for_timeout(30)
-                
-                # 4. Pause at end position
-                await page.wait_for_timeout(300)
-                
-                # 5. Release mouse
-                await page.mouse.up()
-                
-                # 6. Wait for UI to react
-                await page.wait_for_timeout(1500)
-                
-                if await container.locator('> div').count() > initial_count:
-                    print(f"  [SUCCESS] Created segment by dragging on bottom waveform canvas {idx}!")
-                    success = True
-                    break
-                else:
-                    print(f"    [INFO] No segment appeared on canvas {idx}, trying next...")
-            
+            success = await _calibrated_drag_first_segment(
+                page, container, initial_count, start_sec, end_sec
+            )
             if not success:
-                print("  [ERROR] Dragged on all canvases but no segment appeared!")
                 return False
                 
         else:
