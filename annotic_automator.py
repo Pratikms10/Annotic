@@ -370,16 +370,8 @@ async def _clear_segment_textarea(page, row_index):
 
 async def _calibrated_drag_first_segment(page, container, initial_count, start_sec, end_sec):
     """
-    Create the first segment by calibrated drag on the waveform editable lane.
-    1. Wait for waveform & ruler to be visible.
-    2. Identify editable lane (not ruler/header) via elementFromPoint probing.
-    3. Calibrate px/sec from audio duration + waveform container dimensions.
-    4. Scroll waveform container if timestamps not visible.
-    5. Convert start_sec/end_sec to exact viewport X coords.
-    6. Human-like drag from start_x to end_x at vertical center of editable lane.
-    7. Handle popups.
-    8. Verify placeholder created with ±0.05s accuracy.
-    9. Retry once on failure.
+    Create the first segment by finding the playhead via canvas pixel scanning,
+    then dragging from there. No WaveSurfer assumptions.
     """
     MAX_ATTEMPTS = 2
 
@@ -387,20 +379,17 @@ async def _calibrated_drag_first_segment(page, container, initial_count, start_s
         print(f"\n  [ATTEMPT {attempt}/{MAX_ATTEMPTS}] Creating first segment "
               f"[{start_sec:.3f}s - {end_sec:.3f}s]...")
 
-        # ── Step 1: Wait for waveform to be fully loaded ──
+        # ── Step 1: Wait for waveform canvas ──
         try:
             await page.wait_for_selector('canvas', state='visible', timeout=10000)
         except Exception:
             print("  [ERROR] No canvas became visible within 10s!")
             continue
-        await page.wait_for_timeout(1000)  # let waveform fully render
+        await page.wait_for_timeout(1500)
 
-        # ── Step 2: Scroll waveform into view & probe DOM for calibration ──
-        probe = await page.evaluate("""() => {
-            const audio = document.querySelector('audio');
-            const duration = (audio && audio.duration > 0) ? audio.duration : 0;
-
-            // Find ALL canvases sorted by vertical position (bottom-most first)
+        # ── Step 2: Scroll canvas into view & find playhead by scanning pixels ──
+        result = await page.evaluate("""() => {
+            // Find bottom-most large canvas (the waveform)
             const canvases = Array.from(document.querySelectorAll('canvas'))
                 .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
                 .filter(c => c.rect.width > 100 && c.rect.height > 10)
@@ -408,237 +397,230 @@ async def _calibrated_drag_first_segment(page, container, initial_count, start_s
 
             if (!canvases.length) return { error: 'no_canvas' };
 
-            const mainCanvas = canvases[0];
-            const cRect = mainCanvas.rect;
+            const main = canvases[0];
+            main.el.scrollIntoView({ block: 'center', behavior: 'instant' });
 
-            // Scroll canvas into view
-            mainCanvas.el.scrollIntoView({ block: 'center', behavior: 'instant' });
+            // Re-read rect after scroll
+            const cRect = main.el.getBoundingClientRect();
+            const canvas = main.el;
+            const pxW = canvas.width;   // internal pixel width
+            const pxH = canvas.height;  // internal pixel height
+            const ratio = cRect.width / pxW;  // CSS px per canvas px
 
-            // Probe hit element
-            const centerY = cRect.top + cRect.height * 0.5;
-            const probeX = cRect.left + cRect.width * 0.5;
-            const hitEl = document.elementFromPoint(probeX, centerY);
-            const hitTag = hitEl ? hitEl.tagName : 'NONE';
-            const hitId = hitEl ? (hitEl.id || '') : '';
-            const hitClass = hitEl ? (hitEl.className || '').toString().substring(0, 80) : '';
+            let playheadCssX = null;
+            let pxPerSec = 0;
+            let method = 'none';
 
-            // ── Find scroll container (check CSS overflow, not just scrollWidth) ──
-            let scrollEl = null;
-            let el = mainCanvas.el.parentElement;
-            while (el && el !== document.body) {
-                const style = window.getComputedStyle(el);
-                const ovx = style.overflowX;
-                if ((ovx === 'auto' || ovx === 'scroll' || ovx === 'hidden') &&
-                    el.scrollWidth > el.clientWidth + 5) {
-                    scrollEl = el;
-                    break;
-                }
-                el = el.parentElement;
-            }
+            // ── METHOD 1: Scan canvas pixels for the red playhead line ──
+            try {
+                const ctx = canvas.getContext('2d');
+                if (ctx) {
+                    const imgData = ctx.getImageData(0, 0, pxW, pxH);
+                    const d = imgData.data;
 
-            // ── Find ruler/timeline markers (DOM elements with time text) ──
-            const timeRegex = /^\\d{2}:\\d{2}:\\d{2}$/;
-            const markers = [];
-            const allEls = document.querySelectorAll('span, div, p, label');
-            for (const e of allEls) {
-                const text = (e.textContent || '').trim();
-                if (timeRegex.test(text) && e.childNodes.length <= 1) {
-                    const r = e.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0 &&
-                        Math.abs(r.top - cRect.top) < 200) {
-                        const parts = text.split(':');
-                        const secs = parseInt(parts[0])*3600 + parseInt(parts[1])*60 + parseInt(parts[2]);
-                        markers.push({ text, secs, x: r.left + r.width/2, y: r.top });
+                    // Scan each column for red pixels (R>150, G<100, B<100)
+                    // Sample the middle 60% of the canvas height (skip ruler at top)
+                    for (let x = 0; x < pxW; x++) {
+                        let redCount = 0;
+                        const samples = 12;
+                        for (let s = 0; s < samples; s++) {
+                            const y = Math.floor(pxH * 0.2 + (pxH * 0.6) * (s / samples));
+                            const i = (y * pxW + x) * 4;
+                            const r = d[i], g = d[i+1], b = d[i+2], a = d[i+3];
+                            if (r > 150 && g < 120 && b < 120 && (r - g) > 40 && a > 100) {
+                                redCount++;
+                            }
+                        }
+                        if (redCount >= 4) {
+                            playheadCssX = cRect.left + x * ratio;
+                            method = 'pixel_scan';
+                            break;
+                        }
+                    }
+
+                    // ── Also find ruler tick spacing for pxPerSec ──
+                    if (playheadCssX !== null) {
+                        // Scan top 20% of canvas for dark vertical lines (ruler ticks)
+                        const rulerH = Math.floor(pxH * 0.2);
+                        const ticks = [];
+                        for (let x = 0; x < pxW; x++) {
+                            let darkCount = 0;
+                            for (let y = 2; y < rulerH; y += 2) {
+                                const i = (y * pxW + x) * 4;
+                                const brightness = d[i] + d[i+1] + d[i+2];
+                                if (brightness < 350 && d[i+3] > 150) darkCount++;
+                            }
+                            if (darkCount >= rulerH * 0.15) {
+                                if (!ticks.length || x - ticks[ticks.length-1] > 10) {
+                                    ticks.push(x);
+                                }
+                            }
+                        }
+
+                        if (ticks.length >= 3) {
+                            // Compute median tick spacing (each tick = 1 second)
+                            const spacings = [];
+                            for (let i = 1; i < ticks.length; i++) {
+                                spacings.push(ticks[i] - ticks[i-1]);
+                            }
+                            spacings.sort((a, b) => a - b);
+                            const median = spacings[Math.floor(spacings.length / 2)];
+                            pxPerSec = median * ratio;
+                            method += '+ticks(' + ticks.length + ',spacing=' + Math.round(median) + ')';
+                        }
                     }
                 }
-            }
-            markers.sort((a, b) => a.secs - b.secs);
-
-            // ── Find cursor/playhead (red vertical line) ──
-            let cursorX = null;
-            const cursorCandidates = document.querySelectorAll(
-                '[class*="cursor"], [class*="Cursor"], [class*="playhead"], [class*="progress"]'
-            );
-            for (const c of cursorCandidates) {
-                const r = c.getBoundingClientRect();
-                if (r.height > 20 && r.width < 10 &&
-                    Math.abs(r.top - cRect.top) < 50) {
-                    cursorX = r.left + r.width / 2;
-                    break;
-                }
+            } catch (e) {
+                method = 'pixel_failed:' + e.message;
             }
 
-            // ── Compute pxPerSec from markers ──
-            let pxPerSec = 0;
-            let originX = null;  // viewport X of timestamp 0
-            let calibSource = 'none';
-
-            if (markers.length >= 2) {
-                // Use first two distinct-time markers
-                for (let i = 1; i < markers.length; i++) {
-                    if (markers[i].secs !== markers[0].secs) {
-                        pxPerSec = (markers[i].x - markers[0].x) / (markers[i].secs - markers[0].secs);
-                        originX = markers[0].x - markers[0].secs * pxPerSec;
-                        calibSource = 'markers(' + markers[0].text + '→' + markers[i].text + ')';
+            // ── METHOD 2: Find cursor as a thin tall DOM element ──
+            if (playheadCssX === null) {
+                const allEls = document.querySelectorAll('div, span');
+                for (const el of allEls) {
+                    const r = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    if (r.width > 0 && r.width < 6 && r.height > 40 &&
+                        style.position === 'absolute' &&
+                        r.top >= cRect.top - 5 && r.bottom <= cRect.bottom + 5) {
+                        playheadCssX = r.left + r.width / 2;
+                        method = 'dom_thin_element';
                         break;
                     }
                 }
             }
 
-            if (!pxPerSec && cursorX !== null && duration > 0) {
-                // Assume cursor is at time 0, use totalWidth/duration for scale
-                const totalWidth = scrollEl ? scrollEl.scrollWidth : cRect.width;
-                pxPerSec = totalWidth / duration;
-                originX = cursorX;
-                calibSource = 'cursor+totalWidth';
+            // ── METHOD 3: Search by class names ──
+            if (playheadCssX === null) {
+                const selectors = [
+                    '[class*="cursor"]', '[class*="Cursor"]',
+                    '[class*="playhead"]', '[class*="Playhead"]',
+                    '[class*="progress"]', '[class*="Progress"]'
+                ];
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        const r = el.getBoundingClientRect();
+                        if (r.height > 20 && r.width < 10 &&
+                            Math.abs(r.top - cRect.top) < 60) {
+                            playheadCssX = r.left + r.width / 2;
+                            method = 'dom_class(' + sel + ')';
+                            break;
+                        }
+                    }
+                    if (playheadCssX !== null) break;
+                }
             }
 
-            if (!pxPerSec && duration > 0) {
-                // Fallback: assume no offset
-                const totalWidth = scrollEl ? scrollEl.scrollWidth : cRect.width;
-                const scrollLeft = scrollEl ? scrollEl.scrollLeft : 0;
-                pxPerSec = totalWidth / duration;
-                originX = cRect.left - scrollLeft;
-                calibSource = 'fallback';
-            }
+            const audio = document.querySelector('audio');
+            const duration = (audio && audio.duration > 0) ? audio.duration : 0;
 
             return {
-                duration,
-                canvasTop: cRect.top, canvasLeft: cRect.left,
-                canvasWidth: cRect.width, canvasHeight: cRect.height,
-                hitTag, hitId, hitClass,
-                hasScrollContainer: !!scrollEl,
-                scrollLeft: scrollEl ? scrollEl.scrollLeft : 0,
-                scrollWidth: scrollEl ? scrollEl.scrollWidth : cRect.width,
-                containerLeft: scrollEl ? scrollEl.getBoundingClientRect().left : cRect.left,
-                containerWidth: scrollEl ? scrollEl.clientWidth : cRect.width,
+                playheadCssX,
                 pxPerSec,
-                originX,
-                calibSource,
-                markerCount: markers.length,
-                markers: markers.slice(0, 5).map(m => m.text + '@' + Math.round(m.x)),
-                cursorX
+                method,
+                canvasTop: cRect.top,
+                canvasLeft: cRect.left,
+                canvasWidth: cRect.width,
+                canvasHeight: cRect.height,
+                internalW: pxW,
+                internalH: pxH,
+                ratio,
+                duration
             };
         }""")
 
-        if not probe or probe.get('error'):
-            print(f"  [ERROR] DOM probe failed: {probe}")
+        if not result or result.get('error'):
+            print(f"  [ERROR] Probe failed: {result}")
             continue
 
-        print(f"    Duration: {probe['duration']:.1f}s | pxPerSec: {probe['pxPerSec']:.2f}")
-        print(f"    Calibration source: {probe['calibSource']}")
-        print(f"    Origin X (timestamp 0): {probe['originX']}")
-        print(f"    Markers found: {probe['markerCount']} → {probe['markers']}")
-        print(f"    Cursor X: {probe['cursorX']}")
-        print(f"    Canvas: top={probe['canvasTop']:.0f} left={probe['canvasLeft']:.0f} "
-              f"w={probe['canvasWidth']:.0f} h={probe['canvasHeight']:.0f}")
-        print(f"    Hit element: <{probe['hitTag']}> id='{probe['hitId']}' "
-              f"class='{probe['hitClass']}'")
-        print(f"    Scroll: has={probe['hasScrollContainer']} "
-              f"scrollLeft={probe['scrollLeft']:.0f} scrollWidth={probe['scrollWidth']:.0f}")
+        playhead_x = result['playheadCssX']
+        pps = result['pxPerSec']
+        print(f"    Method: {result['method']}")
+        print(f"    Playhead X: {playhead_x}")
+        print(f"    pxPerSec: {pps:.1f}")
+        print(f"    Canvas: left={result['canvasLeft']:.0f} top={result['canvasTop']:.0f} "
+              f"w={result['canvasWidth']:.0f} h={result['canvasHeight']:.0f}")
+        print(f"    Internal: {result['internalW']}x{result['internalH']} ratio={result['ratio']:.2f}")
 
-        if probe['pxPerSec'] <= 0 or probe['originX'] is None:
-            print("  [ERROR] Could not calibrate timeline!")
+        if playhead_x is None:
+            print("  [ERROR] Could not find playhead (timestamp 0)!")
             continue
 
-        # Re-read canvas position after scrollIntoView
-        await page.wait_for_timeout(500)
-        fresh_rect = await page.evaluate("""() => {
-            const canvases = Array.from(document.querySelectorAll('canvas'))
-                .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
-                .filter(c => c.rect.width > 100 && c.rect.height > 10)
-                .sort((a, b) => b.rect.top - a.rect.top);
-            if (!canvases.length) return null;
-            return {
-                canvasTop: canvases[0].rect.top,
-                canvasHeight: canvases[0].rect.height,
-                canvasLeft: canvases[0].rect.left,
-                canvasWidth: canvases[0].rect.width
-            };
-        }""")
+        # ── Step 3: Compute drag coordinates ──
+        canvas_left = result['canvasLeft']
+        canvas_width = result['canvasWidth']
+        canvas_top = result['canvasTop']
+        canvas_height = result['canvasHeight']
 
-        if not fresh_rect:
-            print("  [ERROR] Lost canvas after scroll!")
-            continue
+        if pps > 0:
+            # We have px/sec calibration — use it for precise positioning
+            start_x = playhead_x + (start_sec * pps)
+            end_x = playhead_x + (end_sec * pps)
+        else:
+            # No tick calibration — just drag from playhead ~200px right
+            start_x = playhead_x
+            end_x = playhead_x + min(250, canvas_width * 0.15)
 
-        pxPerSec = probe['pxPerSec']
-        originX = probe['originX']
+        # Clamp to canvas bounds
+        start_x = max(canvas_left + 5, min(start_x, canvas_left + canvas_width - 25))
+        end_x = max(start_x + 20, min(end_x, canvas_left + canvas_width - 5))
 
-        # ── Step 3: Convert timestamps to viewport X using ORIGIN ──
-        start_x = originX + (start_sec * pxPerSec)
-        end_x = originX + (end_sec * pxPerSec)
-
-        # Clamp to visible container bounds (with small margin)
-        left_bound = fresh_rect['canvasLeft'] + 5
-        right_bound = fresh_rect['canvasLeft'] + fresh_rect['canvasWidth'] - 5
-        start_x = max(left_bound, min(start_x, right_bound - 20))
-        end_x = max(start_x + 15, min(end_x, right_bound))
-
-        # Editable lane Y = vertical center of canvas (NOT the ruler at top)
-        # Use lower 70% of canvas to avoid ruler area at top
-        y = fresh_rect['canvasTop'] + fresh_rect['canvasHeight'] * 0.7
+        # Y = lower 70% of canvas (below ruler area at top)
+        y = canvas_top + canvas_height * 0.7
 
         drag_distance = end_x - start_x
-        print(f"    Computed drag: X={start_x:.1f} -> {end_x:.1f} "
-              f"(dist={drag_distance:.1f}px) at Y={y:.1f}")
+        print(f"    Drag: X={start_x:.0f} → {end_x:.0f} (dist={drag_distance:.0f}px) Y={y:.0f}")
 
         if drag_distance < 10:
             print("  [ERROR] Drag distance too small!")
             continue
 
-        # ── Step 5: Human-like drag ──
-        # Move to start position
+        # ── Step 4: Human-like drag ──
         await page.mouse.move(start_x, y)
         await page.wait_for_timeout(300)
 
-        # Press down and hold
         await page.mouse.down()
         await page.wait_for_timeout(200)
 
-        # Drag in incremental steps (human-like ~30ms between ~5px steps)
         num_steps = max(25, int(drag_distance / 6))
         step_size = drag_distance / num_steps
-        current_x = start_x
+        cx = start_x
         for _ in range(num_steps):
-            current_x += step_size
-            await page.mouse.move(current_x, y)
+            cx += step_size
+            await page.mouse.move(cx, y)
             await page.wait_for_timeout(30)
 
-        # Pause at end
         await page.wait_for_timeout(250)
-
-        # Release
         await page.mouse.up()
-        print("    Mouse released. Waiting for UI reaction...")
+        print("    Mouse released. Waiting for UI...")
 
-        # ── Step 6: Handle any popups/dialogs ──
+        # ── Step 5: Handle popups ──
         await page.wait_for_timeout(500)
-        # Dismiss any MUI dialog / overlay that might appear
         try:
-            popup_btns = page.locator('button:has-text("OK"), button:has-text("Yes"), '
-                                       'button:has-text("Confirm"), button:has-text("Accept")')
-            if await popup_btns.count() > 0:
-                print("    [POPUP] Dismissing popup...")
-                await popup_btns.first.click()
+            popup = page.locator('button:has-text("OK"), button:has-text("Yes"), '
+                                 'button:has-text("Confirm"), button:has-text("Accept")')
+            if await popup.count() > 0:
+                print("    [POPUP] Dismissing...")
+                await popup.first.click()
                 await page.wait_for_timeout(500)
         except Exception:
             pass
 
         await page.wait_for_timeout(1000)
 
-        # ── Step 7: Verify placeholder appeared ──
+        # ── Step 6: Verify placeholder appeared ──
         new_count = await container.locator('> div').count()
         if new_count <= initial_count:
-            print(f"    [FAIL] No new segment row! (count still {new_count})")
-            # Try clicking anywhere else first to deselect, then retry
+            print(f"    [FAIL] No new segment! (count={new_count})")
             await page.mouse.click(10, 10)
             await page.wait_for_timeout(300)
             continue
 
-        print(f"  [SUCCESS] Placeholder appeared! (rows: {initial_count} -> {new_count})")
+        print(f"  [SUCCESS] Placeholder created! (rows: {initial_count} → {new_count})")
         return True
 
-    print("  [ERROR] All attempts failed to create first segment!")
+    print("  [ERROR] All attempts failed!")
     return False
 
 async def click_add_segment(page, is_first=False, start_sec=0.0, end_sec=10.0):
