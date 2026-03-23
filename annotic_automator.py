@@ -411,27 +411,29 @@ async def _calibrated_drag_first_segment(page, container, initial_count, start_s
             let pxPerSec = 0;
             let method = 'none';
 
-            // ── METHOD 1: Scan canvas pixels for the red playhead line ──
+            // ── METHOD 1: Scan canvas pixels for the CYAN playhead line ──
             try {
                 const ctx = canvas.getContext('2d');
                 if (ctx) {
                     const imgData = ctx.getImageData(0, 0, pxW, pxH);
                     const d = imgData.data;
 
-                    // Scan each column for red pixels (R>150, G<100, B<100)
+                    // Scan each column for CYAN pixels (low R, high G, high B)
+                    // The playhead is a cyan/turquoise vertical line
                     // Sample the middle 60% of the canvas height (skip ruler at top)
                     for (let x = 0; x < pxW; x++) {
-                        let redCount = 0;
+                        let cyanCount = 0;
                         const samples = 12;
                         for (let s = 0; s < samples; s++) {
                             const y = Math.floor(pxH * 0.2 + (pxH * 0.6) * (s / samples));
                             const i = (y * pxW + x) * 4;
                             const r = d[i], g = d[i+1], b = d[i+2], a = d[i+3];
-                            if (r > 150 && g < 120 && b < 120 && (r - g) > 40 && a > 100) {
-                                redCount++;
+                            // Cyan: R<120, G>150, B>150, and G+B much higher than R
+                            if (r < 120 && g > 140 && b > 140 && (g + b - 2*r) > 100 && a > 100) {
+                                cyanCount++;
                             }
                         }
-                        if (redCount >= 4) {
+                        if (cyanCount >= 4) {
                             playheadCssX = cRect.left + x * ratio;
                             method = 'pixel_scan';
                             break;
