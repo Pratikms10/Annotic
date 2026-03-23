@@ -378,7 +378,7 @@ async def click_add_segment(page, is_first=False):
         initial_count = await container.locator('> div').count()
         
         if is_first or initial_count == 0:
-            print("  [INFO] First segment: simulating physical mouse drag on timeline to create placeholder...")
+            print("  [INFO] First segment: simulating human-speed mouse drag on timeline...")
             
             canvases = page.locator('canvas')
             num_canvases = await canvases.count()
@@ -393,54 +393,66 @@ async def click_add_segment(page, is_first=False):
                 if not box or box['width'] < 100 or box['height'] < 20: 
                     continue
                     
+                # Drag from ~10% to ~40% of the waveform width (a moderate partial drag)
                 start_x = box['x'] + (box['width'] * 0.1)
-                end_x = start_x + 300
+                end_x   = box['x'] + (box['width'] * 0.4)
                 
                 win_width = await page.evaluate("window.innerWidth")
                 if end_x > win_width - 10: end_x = win_width - 20
                 
-                # Perform a barrage of drags at different Y heights to ensure we hit the "timeline ruler" 
-                # which might be specifically positioned above or at the very top of the canvas!
+                drag_distance = end_x - start_x
+                
+                # Try different Y heights to find the interactive region
                 y_offsets = [
-                    box['y'] - 20,              # Ruler above waveform
-                    box['y'] + 5,               # Canvas top edge
-                    box['y'] + box['height']*0.5, # Canvas center
-                    box['y'] + box['height'] - 5  # Canvas bottom edge
+                    box['y'] - 20,                  # Ruler above waveform
+                    box['y'] + 5,                   # Canvas top edge
+                    box['y'] + box['height'] * 0.25, # Upper quarter
+                    box['y'] + box['height'] * 0.5,  # Canvas center
+                    box['y'] + box['height'] - 5     # Canvas bottom edge
                 ]
                 
                 for y in y_offsets:
                     if y < 0: continue
-                    print(f"    -> Dragging horizontally at Y={y:.1f}...")
+                    print(f"    -> Human-speed drag at Y={y:.1f} from X={start_x:.0f} to X={end_x:.0f}...")
                     
-                    # Native Playwright UI event
+                    # ── HUMAN-LIKE DRAG: slow, stepped, realistic ──
+                    
+                    # 1. Move to starting position (like hovering the cursor there)
                     await page.mouse.move(start_x, y)
-                    await page.wait_for_timeout(50)
+                    await page.wait_for_timeout(200)  # Pause before clicking
+                    
+                    # 2. Press mouse down and hold briefly (human reaction)
                     await page.mouse.down()
-                    await page.wait_for_timeout(50)
-                    await page.mouse.move(end_x, y, steps=15)
-                    await page.wait_for_timeout(50)
+                    await page.wait_for_timeout(150)  # Hold down before moving
+                    
+                    # 3. Drag slowly across in small increments (~5-8px steps, 30-50ms between)
+                    num_steps = 40
+                    step_size = drag_distance / num_steps
+                    current_x = start_x
+                    
+                    for step in range(num_steps):
+                        current_x += step_size
+                        await page.mouse.move(current_x, y)
+                        await page.wait_for_timeout(35)  # ~35ms between each micro-move
+                    
+                    # 4. Small pause at end position (human hesitation before releasing)
+                    await page.wait_for_timeout(200)
+                    
+                    # 5. Release mouse
                     await page.mouse.up()
                     
-                    # Native Web Event Bypass
-                    await page.evaluate(f"""() => {{
-                        const y = {y};
-                        const target = document.elementFromPoint({start_x}, y) || document.body;
-                        target.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, clientX: {start_x}, clientY: y, buttons: 1 }}));
-                        target.dispatchEvent(new MouseEvent('mousemove', {{ bubbles: true, clientX: {end_x}, clientY: y, buttons: 1 }}));
-                        target.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, clientX: {end_x}, clientY: y, buttons: 0 }}));
-                    }}""")
-                    
-                    await page.wait_for_timeout(500)
+                    # 6. Wait for UI to react
+                    await page.wait_for_timeout(1000)
                     
                     if await container.locator('> div').count() > initial_count:
-                        print(f"  [SUCCESS] Created segment by sliding timeline at Y={y:.1f}.")
+                        print(f"  [SUCCESS] Created segment by sliding timeline at Y={y:.1f}!")
                         success = True
                         break
                 
                 if success: break
             
             if not success:
-                print("  [ERROR] Dragged efficiently across all Y-offsets but no segment appeared!")
+                print("  [ERROR] Dragged on all canvases but no segment appeared!")
                 return False
                 
         else:
