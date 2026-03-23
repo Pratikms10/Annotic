@@ -395,7 +395,7 @@ async def _calibrated_drag_first_segment(page, container, initial_count, start_s
             continue
         await page.wait_for_timeout(1000)  # let waveform fully render
 
-        # ── Step 2: Scroll waveform into view & probe DOM ──
+        # ── Step 2: Scroll waveform into view & probe DOM for calibration ──
         probe = await page.evaluate("""() => {
             const audio = document.querySelector('audio');
             const duration = (audio && audio.duration > 0) ? audio.duration : 0;
@@ -408,52 +408,116 @@ async def _calibrated_drag_first_segment(page, container, initial_count, start_s
 
             if (!canvases.length) return { error: 'no_canvas' };
 
-            const mainCanvas = canvases[0]; // bottom-most = waveform
+            const mainCanvas = canvases[0];
             const cRect = mainCanvas.rect;
 
             // Scroll canvas into view
             mainCanvas.el.scrollIntoView({ block: 'center', behavior: 'instant' });
 
-            // Probe at vertical center to find what element receives events
+            // Probe hit element
             const centerY = cRect.top + cRect.height * 0.5;
-            const probeX = cRect.left + 50;
+            const probeX = cRect.left + cRect.width * 0.5;
             const hitEl = document.elementFromPoint(probeX, centerY);
             const hitTag = hitEl ? hitEl.tagName : 'NONE';
             const hitId = hitEl ? (hitEl.id || '') : '';
             const hitClass = hitEl ? (hitEl.className || '').toString().substring(0, 80) : '';
 
-            // Find scrollable ancestor of the canvas (waveform scroll container)
+            // ── Find scroll container (check CSS overflow, not just scrollWidth) ──
             let scrollEl = null;
             let el = mainCanvas.el.parentElement;
             while (el && el !== document.body) {
-                if (el.scrollWidth > el.clientWidth + 10) {
+                const style = window.getComputedStyle(el);
+                const ovx = style.overflowX;
+                if ((ovx === 'auto' || ovx === 'scroll' || ovx === 'hidden') &&
+                    el.scrollWidth > el.clientWidth + 5) {
                     scrollEl = el;
                     break;
                 }
                 el = el.parentElement;
             }
 
-            const totalWidth = scrollEl ? scrollEl.scrollWidth : cRect.width;
-            const scrollLeft = scrollEl ? scrollEl.scrollLeft : 0;
-            const containerRect = scrollEl
-                ? scrollEl.getBoundingClientRect()
-                : cRect;
+            // ── Find ruler/timeline markers (DOM elements with time text) ──
+            const timeRegex = /^\\d{2}:\\d{2}:\\d{2}$/;
+            const markers = [];
+            const allEls = document.querySelectorAll('span, div, p, label');
+            for (const e of allEls) {
+                const text = (e.textContent || '').trim();
+                if (timeRegex.test(text) && e.childNodes.length <= 1) {
+                    const r = e.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0 &&
+                        Math.abs(r.top - cRect.top) < 200) {
+                        const parts = text.split(':');
+                        const secs = parseInt(parts[0])*3600 + parseInt(parts[1])*60 + parseInt(parts[2]);
+                        markers.push({ text, secs, x: r.left + r.width/2, y: r.top });
+                    }
+                }
+            }
+            markers.sort((a, b) => a.secs - b.secs);
+
+            // ── Find cursor/playhead (red vertical line) ──
+            let cursorX = null;
+            const cursorCandidates = document.querySelectorAll(
+                '[class*="cursor"], [class*="Cursor"], [class*="playhead"], [class*="progress"]'
+            );
+            for (const c of cursorCandidates) {
+                const r = c.getBoundingClientRect();
+                if (r.height > 20 && r.width < 10 &&
+                    Math.abs(r.top - cRect.top) < 50) {
+                    cursorX = r.left + r.width / 2;
+                    break;
+                }
+            }
+
+            // ── Compute pxPerSec from markers ──
+            let pxPerSec = 0;
+            let originX = null;  // viewport X of timestamp 0
+            let calibSource = 'none';
+
+            if (markers.length >= 2) {
+                // Use first two distinct-time markers
+                for (let i = 1; i < markers.length; i++) {
+                    if (markers[i].secs !== markers[0].secs) {
+                        pxPerSec = (markers[i].x - markers[0].x) / (markers[i].secs - markers[0].secs);
+                        originX = markers[0].x - markers[0].secs * pxPerSec;
+                        calibSource = 'markers(' + markers[0].text + '→' + markers[i].text + ')';
+                        break;
+                    }
+                }
+            }
+
+            if (!pxPerSec && cursorX !== null && duration > 0) {
+                // Assume cursor is at time 0, use totalWidth/duration for scale
+                const totalWidth = scrollEl ? scrollEl.scrollWidth : cRect.width;
+                pxPerSec = totalWidth / duration;
+                originX = cursorX;
+                calibSource = 'cursor+totalWidth';
+            }
+
+            if (!pxPerSec && duration > 0) {
+                // Fallback: assume no offset
+                const totalWidth = scrollEl ? scrollEl.scrollWidth : cRect.width;
+                const scrollLeft = scrollEl ? scrollEl.scrollLeft : 0;
+                pxPerSec = totalWidth / duration;
+                originX = cRect.left - scrollLeft;
+                calibSource = 'fallback';
+            }
 
             return {
                 duration,
-                canvasTop: cRect.top,
-                canvasLeft: cRect.left,
-                canvasWidth: cRect.width,
-                canvasHeight: cRect.height,
+                canvasTop: cRect.top, canvasLeft: cRect.left,
+                canvasWidth: cRect.width, canvasHeight: cRect.height,
                 hitTag, hitId, hitClass,
                 hasScrollContainer: !!scrollEl,
-                totalWaveWidth: totalWidth,
-                scrollLeft,
-                containerLeft: containerRect.left,
-                containerWidth: containerRect.width,
-                containerTop: containerRect.top,
-                containerHeight: containerRect.height,
-                pxPerSec: duration > 0 ? totalWidth / duration : 0
+                scrollLeft: scrollEl ? scrollEl.scrollLeft : 0,
+                scrollWidth: scrollEl ? scrollEl.scrollWidth : cRect.width,
+                containerLeft: scrollEl ? scrollEl.getBoundingClientRect().left : cRect.left,
+                containerWidth: scrollEl ? scrollEl.clientWidth : cRect.width,
+                pxPerSec,
+                originX,
+                calibSource,
+                markerCount: markers.length,
+                markers: markers.slice(0, 5).map(m => m.text + '@' + Math.round(m.x)),
+                cursorX
             };
         }""")
 
@@ -462,111 +526,57 @@ async def _calibrated_drag_first_segment(page, container, initial_count, start_s
             continue
 
         print(f"    Duration: {probe['duration']:.1f}s | pxPerSec: {probe['pxPerSec']:.2f}")
+        print(f"    Calibration source: {probe['calibSource']}")
+        print(f"    Origin X (timestamp 0): {probe['originX']}")
+        print(f"    Markers found: {probe['markerCount']} → {probe['markers']}")
+        print(f"    Cursor X: {probe['cursorX']}")
         print(f"    Canvas: top={probe['canvasTop']:.0f} left={probe['canvasLeft']:.0f} "
               f"w={probe['canvasWidth']:.0f} h={probe['canvasHeight']:.0f}")
-        print(f"    Hit element at center: <{probe['hitTag']}> id='{probe['hitId']}' "
+        print(f"    Hit element: <{probe['hitTag']}> id='{probe['hitId']}' "
               f"class='{probe['hitClass']}'")
-        print(f"    Scroll container: {probe['hasScrollContainer']} "
-              f"totalWidth={probe['totalWaveWidth']:.0f} scrollLeft={probe['scrollLeft']:.0f}")
+        print(f"    Scroll: has={probe['hasScrollContainer']} "
+              f"scrollLeft={probe['scrollLeft']:.0f} scrollWidth={probe['scrollWidth']:.0f}")
 
-        if probe['pxPerSec'] <= 0:
-            print("  [ERROR] Could not compute pxPerSec!")
+        if probe['pxPerSec'] <= 0 or probe['originX'] is None:
+            print("  [ERROR] Could not calibrate timeline!")
             continue
 
         # Re-read canvas position after scrollIntoView
         await page.wait_for_timeout(500)
-        fresh = await page.evaluate("""() => {
+        fresh_rect = await page.evaluate("""() => {
             const canvases = Array.from(document.querySelectorAll('canvas'))
                 .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
                 .filter(c => c.rect.width > 100 && c.rect.height > 10)
                 .sort((a, b) => b.rect.top - a.rect.top);
             if (!canvases.length) return null;
-            const r = canvases[0].rect;
-
-            let scrollEl = null;
-            let el = canvases[0].el.parentElement;
-            while (el && el !== document.body) {
-                if (el.scrollWidth > el.clientWidth + 10) {
-                    scrollEl = el;
-                    break;
-                }
-                el = el.parentElement;
-            }
-            const scrollLeft = scrollEl ? scrollEl.scrollLeft : 0;
-            const cr = scrollEl ? scrollEl.getBoundingClientRect() : r;
-
             return {
-                canvasTop: r.top, canvasHeight: r.height,
-                containerLeft: cr.left, containerWidth: cr.width,
-                scrollLeft
+                canvasTop: canvases[0].rect.top,
+                canvasHeight: canvases[0].rect.height,
+                canvasLeft: canvases[0].rect.left,
+                canvasWidth: canvases[0].rect.width
             };
         }""")
 
-        if not fresh:
+        if not fresh_rect:
             print("  [ERROR] Lost canvas after scroll!")
             continue
 
         pxPerSec = probe['pxPerSec']
+        originX = probe['originX']
 
-        # ── Step 3: Ensure target timestamps are visible ──
-        start_px_total = start_sec * pxPerSec  # position in full waveform
-        end_px_total = end_sec * pxPerSec
-
-        # If the end position exceeds visible range, scroll the waveform container
-        visible_start = fresh['scrollLeft']
-        visible_end = fresh['scrollLeft'] + fresh['containerWidth']
-
-        if start_px_total < visible_start or end_px_total > visible_end:
-            target_scroll = max(0, start_px_total - 30)
-            print(f"    Scrolling waveform container to scrollLeft={target_scroll:.0f}...")
-            await page.evaluate("""(targetScroll) => {
-                const canvases = Array.from(document.querySelectorAll('canvas'))
-                    .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
-                    .filter(c => c.rect.width > 100 && c.rect.height > 10)
-                    .sort((a, b) => b.rect.top - a.rect.top);
-                let el = canvases[0].el.parentElement;
-                while (el && el !== document.body) {
-                    if (el.scrollWidth > el.clientWidth + 10) {
-                        el.scrollLeft = targetScroll;
-                        break;
-                    }
-                    el = el.parentElement;
-                }
-            }""", target_scroll)
-            await page.wait_for_timeout(300)
-
-            # Re-read scroll position
-            new_scroll = await page.evaluate("""() => {
-                const canvases = Array.from(document.querySelectorAll('canvas'))
-                    .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
-                    .filter(c => c.rect.width > 100 && c.rect.height > 10)
-                    .sort((a, b) => b.rect.top - a.rect.top);
-                let el = canvases[0].el.parentElement;
-                while (el && el !== document.body) {
-                    if (el.scrollWidth > el.clientWidth + 10) {
-                        return { scrollLeft: el.scrollLeft, left: el.getBoundingClientRect().left };
-                    }
-                    el = el.parentElement;
-                }
-                const r = canvases[0].rect;
-                return { scrollLeft: 0, left: r.left };
-            }""")
-            fresh['scrollLeft'] = new_scroll['scrollLeft']
-            fresh['containerLeft'] = new_scroll['left']
-
-        # ── Step 4: Convert timestamps to viewport X coordinates ──
-        start_x = fresh['containerLeft'] + (start_px_total - fresh['scrollLeft'])
-        end_x = fresh['containerLeft'] + (end_px_total - fresh['scrollLeft'])
+        # ── Step 3: Convert timestamps to viewport X using ORIGIN ──
+        start_x = originX + (start_sec * pxPerSec)
+        end_x = originX + (end_sec * pxPerSec)
 
         # Clamp to visible container bounds (with small margin)
-        left_bound = fresh['containerLeft'] + 5
-        right_bound = fresh['containerLeft'] + fresh['containerWidth'] - 5
+        left_bound = fresh_rect['canvasLeft'] + 5
+        right_bound = fresh_rect['canvasLeft'] + fresh_rect['canvasWidth'] - 5
         start_x = max(left_bound, min(start_x, right_bound - 20))
         end_x = max(start_x + 15, min(end_x, right_bound))
 
         # Editable lane Y = vertical center of canvas (NOT the ruler at top)
         # Use lower 70% of canvas to avoid ruler area at top
-        y = fresh['canvasTop'] + fresh['canvasHeight'] * 0.7
+        y = fresh_rect['canvasTop'] + fresh_rect['canvasHeight'] * 0.7
 
         drag_distance = end_x - start_x
         print(f"    Computed drag: X={start_x:.1f} -> {end_x:.1f} "
