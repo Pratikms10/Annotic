@@ -91,71 +91,19 @@ async def automate_annotic():
             print(f"  ... and {len(fill_chunks)-15} more.")
 
         # ==============================================================
-        # STEP 3: Delete ALL Existing Segments
+        # STEP 3: Reconcile Segments (Preserve & Adjust)
         # ==============================================================
         print("\n" + "=" * 60)
-        print("  STEP 3: Delete All Existing Segments")
+        print("  STEP 3: Reconcile Segments (Preserve & Adjust)")
         print("=" * 60)
 
-        await delete_all_segments(page)
+        await reconcile_segments(page, fill_chunks, ap)
 
         # ==============================================================
-        # STEP 4: Create New Segments & Fill
-        # ==============================================================
-        print("\n" + "=" * 60)
-        print("  STEP 4: Create Segments & Fill Text")
-        print("=" * 60)
-
-        container = page.locator('#subTitleContainer')
-
-        # To spawn segments cleanly natively as the user requested, we perform
-        # physical Playwright click-and-drags on the audio canvas timeline!
-        audio_elem = page.locator('audio').first
-        audio_dur = 100.0
-        if await audio_elem.count() > 0:
-            audio_dur = await page.evaluate("() => { const a = document.querySelector('audio'); return (a && a.duration) ? a.duration : 100.0; }")
-            
-        waveform = page.locator('canvas, #waveform, .waveform, #wave-timeline').last
-        box = None
-        if await waveform.count() > 0:
-            box = await waveform.bounding_box()
-
-        if not box:
-            print("  [WARN] Cannot find timeline canvas! Physical mouse drag to spawn segments won't work.")
-            
-        initial_count = await container.locator('> div').count()
-        # If user deleted everything, current rows in DOM is 0
-
-        for i, chunk in enumerate(fill_chunks):
-            start_sec = 0.0 if i == 0 else chunk["start"]
-            end_sec   = chunk["end"]
-            text      = chunk["text_final"]
-
-            print(f"\n  Creating segment {i+1}/{len(fill_chunks)}: "
-                  f"[{ap.format_time(start_sec)} - {ap.format_time(end_sec)}] "
-                  f"→ \"{text}\"")
-
-            # 1. Spawn the segment row
-            success = await click_add_segment(page, is_first=(i == 0 and initial_count == 0),
-                                              start_sec=start_sec, end_sec=end_sec)
-            if not success:
-                print(f"  [ERROR] Failed to spawn segment {i+1}. Stopping.")
-                break
-                
-            # Wait a tiny bit for the UI to settle
-            await page.wait_for_timeout(300)
-
-            # 2. Instantly mathematically tune the exact Whisper boundaries
-            await set_segment_timestamps(page, container, initial_count + i, start_sec, end_sec)
-
-            # 3. Fill the textarea
-            await fill_segment_text(page, container, initial_count + i, text)
-
-        # ==============================================================
-        # STEP 5: Save (Click Update)
+        # STEP 4: Save & Verify
         # ==============================================================
         print("\n" + "=" * 60)
-        print("  STEP 5: Save & Verify")
+        print("  STEP 4: Save & Verify")
         print("=" * 60)
 
         await save_and_verify(page)
@@ -172,6 +120,84 @@ async def automate_annotic():
         await page.wait_for_timeout(30000)
         await browser.close()
 
+
+# ======================================================================
+# CORE LOGIC: RECONCILE SEGMENTS
+# ======================================================================
+
+async def reconcile_segments(page, fill_chunks, ap):
+    """
+    Core Logic Refinement: Preserve and Adjust
+    1. Scan existing segments
+    2. Adjust existing segments to match target chunks
+    3. Add missing segments if target > existing
+    4. Delete excess segments if target < existing
+    """
+    container = page.locator('#subTitleContainer')
+    existing = await _count_segments(page)
+    target = len(fill_chunks)
+    
+    print(f"[RECONCILE] Existing placeholders: {existing}, Target segments: {target}")
+    
+    # Pre-validate: Check if we have any segments to fill
+    if target == 0:
+        print("  [WARN] No chunks to fill. Deleting all segments.")
+        await delete_all_segments(page)
+        return
+
+    # PHASE 1: Adjust existing segments (overlapping count)
+    overlap = int(min(existing, target))
+    if overlap > 0:
+        print(f"\n  [Phase 1] Adjusting {overlap} existing segments...")
+        for i in range(overlap):
+            chunk = fill_chunks[i]
+            start = 0.0 if i == 0 else chunk["start"]
+            end = chunk["end"]
+            
+            print(f"    Adjusting {i+1}/{overlap}: [{ap.format_time(start)} - {ap.format_time(end)}]")
+            await set_segment_timestamps(page, container, i, start, end)
+            await fill_segment_text(page, container, i, chunk["text_final"])
+            await page.wait_for_timeout(100)
+            
+    # PHASE 2: Add missing segments
+    if target > existing:
+        missing = target - existing
+        print(f"\n  [Phase 2] Adding {missing} new segments...")
+        for i in range(existing, target):
+            chunk = fill_chunks[i]
+            start = 0.0 if i == 0 else chunk["start"]
+            end = chunk["end"]
+            
+            print(f"    Adding {i+1}/{target}: [{ap.format_time(start)} - {ap.format_time(end)}]")
+            success = await click_add_segment(page, is_first=(existing == 0 and i == 0),
+                                              start_sec=start, end_sec=end)
+            if not success:
+                print(f"  [ERROR] Failed to add segment {i+1}.")
+                break
+                
+            await page.wait_for_timeout(300)
+            await set_segment_timestamps(page, container, i, start, end)
+            await fill_segment_text(page, container, i, chunk["text_final"])
+            
+    # PHASE 3: Remove excess segments from the end
+    if existing > target:
+        excess = existing - target
+        print(f"\n  [Phase 3] Deleting {excess} excess segments from the end...")
+        for i in range(excess):
+            current = await _count_segments(page)
+            if current <= target:
+                break
+                
+            print(f"    Deleting excess segment ({current} left)...")
+            success = await _delete_last_segment_native(page)
+            if not success:
+                print(f"  [ERROR] Failed to delete excess segment at count {current}.")
+                break
+            await page.wait_for_timeout(300)
+
+    # Note: Phase 4 (Validation) is implicitly handled by the accurate 
+    # typing in set_segment_timestamps which mechanically aligns the 
+    # inputs to match the exactly sequenced Whisper chunks.
 
 # ======================================================================
 # DOM INTERACTION HELPERS
