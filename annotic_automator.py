@@ -1069,182 +1069,91 @@ async def _clear_textarea(page, row_index: int):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  CREATE FIRST SEGMENT VIA DRAG
+#  CREATE FIRST SEGMENT VIA SYNTHETIC DRAG
 # ══════════════════════════════════════════════════════════════════════
 
 async def _calibrated_drag_first_segment(page, start_sec: float, end_sec: float) -> bool:
     """
-    Create the first segment by finding the playhead via SCREENSHOT pixel scan.
-    
-    NEW MATH: 
-       x = playhead_x + (t - audio.currentTime) * pxPsec
-    Since we first seek to start_sec, audio.currentTime ≈ start_sec, 
-    so the drag starts exactly at playhead_x and drags right.
+    Create the first segment by dispatching synthetic MouseEvents directly to the 
+    canvas, completely bypassing Playwright's mouse and screenshot locators.
+    This guarantees a drag event is registered by WaveSurfer/React even if the 
+    container is empty.
     """
-    import base64
-    MAX_ATTEMPTS = 2
+    MAX_ATTEMPTS = 3
     
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        print(f"\n    [ATTEMPT {attempt}/{MAX_ATTEMPTS}] Dragging first segment...")
+        print(f"\n    [ATTEMPT {attempt}/{MAX_ATTEMPTS}] Injecting synthetic drag for first segment...")
 
-        # Seek to start first so playhead is roughly where we want to start
-        await _seek_audio(page, start_sec)
+        # Seek to start slightly before the segment to ensure playhead is visible
+        seek_to = max(0.0, start_sec - 1.0)
+        await _seek_audio(page, seek_to)
+        await page.wait_for_timeout(500)
 
-        try:
-            await page.wait_for_selector('canvas', state='visible', timeout=10000)
-        except Exception:
-            print("      [ERROR] No canvas became visible!")
-            continue
-
-        # Scroll canvas into view
-        await page.evaluate("""() => {
+        # Inject a synthetic drag directly via JS
+        success = await page.evaluate("""() => {
             const canvases = Array.from(document.querySelectorAll('canvas'))
-                .filter(c => c.getBoundingClientRect().width > 100);
-            if (canvases.length) canvases[0].scrollIntoView({ block: 'center', behavior: 'instant' });
-        }""")
-        await page.wait_for_timeout(600)
-
-        # Get bounds
-        bounds = await page.evaluate("""() => {
-            const canvases = Array.from(document.querySelectorAll('canvas'))
-                .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
-                .filter(c => c.rect.width > 100 && c.rect.height > 10)
-                .sort((a, b) => b.rect.top - a.rect.top);
-            if (!canvases.length) return null;
-            const r = canvases[0].rect;
-            const audio = document.querySelector('audio');
-            return { 
-                top: r.top, left: r.left, width: r.width, height: r.height,
-                currentTime: audio ? audio.currentTime : 0
-            };
-        }""")
-
-        if not bounds:
-            print("      [ERROR] No canvas found!")
-            continue
-
-        cTop, cLeft, cWidth, cHeight, current_t = (
-            bounds['top'], bounds['left'], bounds['width'], bounds['height'], bounds['currentTime']
-        )
-        
-        # Take screenshot of canvas
-        try:
-            screenshot_bytes = await page.screenshot(clip={
-                'x': max(0, cLeft), 'y': max(0, cTop),
-                'width': cWidth, 'height': cHeight
-            })
-            b64 = base64.b64encode(screenshot_bytes).decode('ascii')
-        except Exception as e:
-            print(f"      [ERROR] Screenshot failed: {e}")
-            continue
-
-        # Scan for playhead and pixels-per-second
-        scan = await page.evaluate("""(b64Data) => {
-            return new Promise((resolve) => {
-                const img = new Image();
-                img.onload = () => {
-                    const c = document.createElement('canvas');
-                    c.width = img.width; c.height = img.height;
-                    const ctx = c.getContext('2d');
-                    ctx.drawImage(img, 0, 0);
-                    const d = ctx.getImageData(0, 0, c.width, c.height).data;
-                    const W = c.width, H = c.height;
-
-                    // Find CYAN playhead
-                    let playheadX = -1;
-                    for (let x = 0; x < W; x++) {
-                        let cyanCount = 0;
-                        for (let s = 0; s < 10; s++) {
-                            const y = Math.floor(H * 0.15 + H * 0.7 * s / 10);
-                            const i = (y * W + x) * 4;
-                            if (d[i] < 130 && d[i+1] > 130 && d[i+2] > 130 &&
-                                (d[i+1] + d[i+2] - 2 * d[i]) > 80) cyanCount++;
-                        }
-                        if (cyanCount >= 3) { playheadX = x; break; }
-                    }
-
-                    // Find ticks for pxPerSec
-                    const rulerH = Math.floor(H * 0.2);
-                    const ticks = [];
-                    for (let x = 0; x < W; x++) {
-                        let darkCount = 0;
-                        for (let y = 1; y < rulerH; y += 2) {
-                            const i = (y * W + x) * 4;
-                            if (d[i]+d[i+1]+d[i+2] < 400 && d[i+3] > 150) darkCount++;
-                        }
-                        if (darkCount >= rulerH * 0.12) {
-                            if (!ticks.length || x - ticks[ticks.length-1] > 10) ticks.push(x);
-                        }
-                    }
-                    let pxPerSec = 0;
-                    if (ticks.length >= 3) {
-                        const spacings = [];
-                        for (let i = 1; i < ticks.length; i++) spacings.push(ticks[i] - ticks[i-1]);
-                        spacings.sort((a,b)=>a-b);
-                        pxPerSec = spacings[Math.floor(spacings.length/2)];
-                    }
-                    resolve({ playheadX, pxPerSec });
-                };
-                img.onerror = () => resolve({ error: 'img_err' });
-                img.src = 'data:image/png;base64,' + b64Data;
-            });
-        }""", b64)
-
-        if not scan or scan.get('error') or scan.get('playheadX') < 0:
-            print("      [ERROR] Could not find cyan playhead tracking!")
-            continue
-
-        ph_px = scan['playheadX']
-        pps = scan['pxPerSec']
-        
-        # Absolute viewport coords
-        ph_viewport = cLeft + ph_px
-        
-        # NEW RELATIVE MATH
-        if pps > 0:
-            start_x = ph_viewport + (start_sec - current_t) * pps
-            end_x   = ph_viewport + (end_sec - current_t) * pps
-        else:
-            # Fallback if no ticks
-            start_x = ph_viewport
-            end_x = ph_viewport + min(250, cWidth * 0.15)
-
-        # Clamp
-        start_x = max(cLeft + 5, min(start_x, cLeft + cWidth - 25))
-        end_x   = max(start_x + 20, min(end_x, cLeft + cWidth - 5))
-        y = cTop + cHeight * 0.7
-        dist = end_x - start_x
-
-        if dist < 10:
-            end_x = start_x + 50
-            dist = 50
-
-        print(f"      Drag: PH_X={ph_viewport:.0f} → start={start_x:.0f}, end={end_x:.0f} (pps={pps:.1f})")
-
-        # Drag
-        await page.mouse.move(start_x, y)
-        await page.wait_for_timeout(300)
-        await page.mouse.down()
-        await page.wait_for_timeout(200)
-
-        steps = max(25, int(dist / 6))
-        for s in range(steps):
-            cx = start_x + (dist * (s+1)/steps)
-            await page.mouse.move(cx, y)
-            await page.wait_for_timeout(30)
+                .filter(c => c.getBoundingClientRect().width > 100)
+                .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+                
+            if (!canvases.length) return false;
+            const canvas = canvases[0];
+            const rect = canvas.getBoundingClientRect();
             
-        await page.wait_for_timeout(250)
-        await page.mouse.up()
+            // Start drag in the middle of the canvas horizontally, lower half vertically
+            const startX = rect.left + (rect.width * 0.4);
+            const startY = rect.top + (rect.height * 0.7);
+            
+            // End drag a bit to the right
+            const endX = startX + 150;
+            const endY = startY;
+
+            function createMouseEvent(type, x, y) {
+                return new MouseEvent(type, {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    clientX: x,
+                    clientY: y,
+                    buttons: type !== 'mouseup' ? 1 : 0
+                });
+            }
+
+            // Dispatch full drag sequence
+            canvas.dispatchEvent(createMouseEvent('mousedown', startX, startY));
+            
+            // Few move steps
+            for(let i=1; i<=5; i++) {
+                let curX = startX + ((endX - Math.floor(startX)) * (i/5));
+                window.dispatchEvent(createMouseEvent('mousemove', curX, startY));
+            }
+            
+            window.dispatchEvent(createMouseEvent('mouseup', endX, endY));
+            return true;
+        }""")
+
+        if not success:
+            print("      [ERROR] Canvas not found for synthetic drag.")
+            continue
+
         await page.wait_for_timeout(1000)
+
+        # Handle potential popups blocking the UI
+        try:
+            popup = page.locator('button:has-text("OK"), button:has-text("Yes"), '
+                                 'button:has-text("Confirm"), button:has-text("Accept")')
+            if await popup.count() > 0:
+                print("      [POPUP] Dismissing...")
+                await popup.first.click()
+                await page.wait_for_timeout(500)
+        except Exception:
+            pass
 
         # Verify
         if await _count_segments(page) > 0:
-            print("      [SUCCESS] First segment spawned via drag!")
+            print("      [SUCCESS] First segment spawned via synthetic drag!")
             return True
             
         print("      [FAIL] No segment appeared...")
-        await page.mouse.click(10, 10)
-        await page.wait_for_timeout(300)
 
     return False
 
