@@ -1069,75 +1069,218 @@ async def _clear_textarea(page, row_index: int):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  CREATE FIRST SEGMENT VIA SYNTHETIC DRAG
+#  CREATE FIRST SEGMENT VIA PLAYHEAD-RELATIVE DRAG
 # ══════════════════════════════════════════════════════════════════════
+
+async def _find_playhead_and_pps(page):
+    """
+    Find the playhead X position and pixels-per-second using 4 DOM strategies.
+    Returns dict: { playhead_x, px_per_sec, canvas_box, strategy, error }
+    All X values are VIEWPORT coordinates.
+    """
+    info = await page.evaluate("""() => {
+        // Find the waveform canvas
+        const canvases = Array.from(document.querySelectorAll('canvas'))
+            .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
+            .filter(c => c.rect.width > 100 && c.rect.height > 10)
+            .sort((a, b) => b.rect.width - a.rect.width);
+        if (!canvases.length) return { error: 'no_canvas' };
+        
+        const canvas = canvases[0];
+        const cRect = canvas.rect;
+        
+        const audio = document.querySelector('audio');
+        const currentTime = audio ? audio.currentTime : 0;
+        const duration = audio ? audio.duration : 0;
+        
+        // Calculate px_per_sec from the canvas scroll width vs audio duration
+        // The canvas's parent is usually scrollable; its scrollWidth represents the full timeline
+        const parent = canvas.el.parentElement;
+        const scrollW = parent ? parent.scrollWidth : cRect.width;
+        const pxPerSec = duration > 0 ? scrollW / duration : 100;
+        
+        let playheadX = -1;
+        let strategy = 'none';
+        
+        // Strategy 1: Look for cursor/playhead element by class
+        const cursorSelectors = [
+            '.wavesurfer-cursor',
+            '[data-testid="cursor"]',
+            '.cursor',
+            'wave cursor'
+        ];
+        for (const sel of cursorSelectors) {
+            const el = document.querySelector(sel);
+            if (el) {
+                const r = el.getBoundingClientRect();
+                if (r.width < 10 && r.height > 20) {
+                    playheadX = r.left + r.width / 2;
+                    strategy = 'cursor_class:' + sel;
+                    break;
+                }
+            }
+        }
+        
+        // Strategy 2: Look inside WaveSurfer's inner <wave> for thin vertical child
+        if (playheadX < 0) {
+            const waves = document.querySelectorAll('wave, .wave, #waveform wave');
+            for (const wave of waves) {
+                for (const child of wave.children) {
+                    const r = child.getBoundingClientRect();
+                    if (r.width <= 3 && r.height > 30 && r.left >= cRect.left && r.left <= cRect.right) {
+                        playheadX = r.left + r.width / 2;
+                        strategy = 'wave_child';
+                        break;
+                    }
+                }
+                if (playheadX >= 0) break;
+            }
+        }
+        
+        // Strategy 3: Search all elements inside the waveform container for thin vertical bars
+        if (playheadX < 0) {
+            const container = canvas.el.parentElement?.parentElement || canvas.el.parentElement;
+            if (container) {
+                const allEls = container.querySelectorAll('*');
+                for (const el of allEls) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 4 && r.height > 30 && r.left >= cRect.left - 5 && r.left <= cRect.right + 5) {
+                        const style = window.getComputedStyle(el);
+                        const bg = style.backgroundColor;
+                        // Playhead is usually brightly colored (cyan, red, white etc)
+                        if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
+                            playheadX = r.left + r.width / 2;
+                            strategy = 'thin_bar';
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Strategy 4: Fallback — use time-based position on the visible canvas
+        if (playheadX < 0) {
+            // If audio is at t=0 and the canvas scrollLeft is 0, playhead is at canvas.left
+            const scrollLeft = parent ? parent.scrollLeft : 0;
+            playheadX = cRect.left + (currentTime * pxPerSec) - scrollLeft;
+            strategy = 'fallback_calc';
+        }
+        
+        // Diagnostic dump for debugging
+        const diag = [];
+        const container2 = canvas.el.parentElement?.parentElement || canvas.el.parentElement;
+        if (container2) {
+            for (const el of container2.querySelectorAll('*')) {
+                const r = el.getBoundingClientRect();
+                if (r.width <= 5 && r.height > 20 && r.left >= cRect.left - 10 && r.left <= cRect.right + 10) {
+                    diag.push({
+                        tag: el.tagName,
+                        className: el.className,
+                        w: r.width, h: r.height,
+                        left: r.left,
+                        bg: window.getComputedStyle(el).backgroundColor
+                    });
+                }
+            }
+        }
+        
+        return {
+            playhead_x: playheadX,
+            px_per_sec: pxPerSec,
+            canvas_box: { x: cRect.left, y: cRect.top, w: cRect.width, h: cRect.height },
+            current_time: currentTime,
+            duration: duration,
+            strategy: strategy,
+            diag: diag.slice(0, 10)
+        };
+    }""")
+    return info
+
 
 async def _calibrated_drag_first_segment(page, start_sec: float, end_sec: float) -> bool:
     """
-    Create the first segment by dispatching synthetic MouseEvents directly to the 
-    canvas, completely bypassing Playwright's mouse and screenshot locators.
-    This guarantees a drag event is registered by WaveSurfer/React even if the 
-    container is empty.
+    Create the first segment by:
+      1. Seeking audio to t=0 (so playhead is at known position)
+      2. Finding playhead via 4 DOM strategies  
+      3. Computing drag start/end using: x = playhead_x + (t - currentTime) * pxPerSec
+      4. Performing a slow physical Playwright mouse drag
     """
     MAX_ATTEMPTS = 3
     
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        print(f"\n    [ATTEMPT {attempt}/{MAX_ATTEMPTS}] Injecting synthetic drag for first segment...")
+        print(f"\n    [ATTEMPT {attempt}/{MAX_ATTEMPTS}] Playhead-relative drag...")
 
-        # Seek to start slightly before the segment to ensure playhead is visible
-        seek_to = max(0.0, start_sec - 1.0)
-        await _seek_audio(page, seek_to)
-        await page.wait_for_timeout(500)
+        # 1. Seek to t=0 to put playhead at a known location
+        await _seek_audio(page, 0.0)
+        await page.wait_for_timeout(600)
 
-        # Inject a synthetic drag directly via JS
-        success = await page.evaluate("""() => {
-            const canvases = Array.from(document.querySelectorAll('canvas'))
-                .filter(c => c.getBoundingClientRect().width > 100)
-                .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
-                
-            if (!canvases.length) return false;
-            const canvas = canvases[0];
-            const rect = canvas.getBoundingClientRect();
-            
-            // Start drag in the middle of the canvas horizontally, lower half vertically
-            const startX = rect.left + (rect.width * 0.4);
-            const startY = rect.top + (rect.height * 0.7);
-            
-            // End drag a bit to the right
-            const endX = startX + 150;
-            const endY = startY;
+        # 2. Scroll canvas into view using Playwright's native method
+        canvas_el = page.locator('canvas').first
+        if await canvas_el.count() == 0:
+            print("      [ERROR] No canvas found!")
+            continue
+        await canvas_el.scroll_into_view_if_needed()
+        await page.wait_for_timeout(400)
 
-            function createMouseEvent(type, x, y) {
-                return new MouseEvent(type, {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                    clientX: x,
-                    clientY: y,
-                    buttons: type !== 'mouseup' ? 1 : 0
-                });
-            }
-
-            // Dispatch full drag sequence
-            canvas.dispatchEvent(createMouseEvent('mousedown', startX, startY));
-            
-            // Few move steps
-            for(let i=1; i<=5; i++) {
-                let curX = startX + ((endX - Math.floor(startX)) * (i/5));
-                window.dispatchEvent(createMouseEvent('mousemove', curX, startY));
-            }
-            
-            window.dispatchEvent(createMouseEvent('mouseup', endX, endY));
-            return true;
-        }""")
-
-        if not success:
-            print("      [ERROR] Canvas not found for synthetic drag.")
+        # 3. Find playhead position and pxPerSec
+        info = await _find_playhead_and_pps(page)
+        
+        if info.get('error'):
+            print(f"      [ERROR] {info['error']}")
             continue
 
+        ph_x = info['playhead_x']
+        pps = info['px_per_sec']
+        cur_t = info['current_time']
+        cb = info['canvas_box']
+        strategy = info['strategy']
+
+        print(f"      Strategy: {strategy}")
+        print(f"      Playhead X: {ph_x:.0f}, PPS: {pps:.1f}, currentTime: {cur_t:.3f}")
+        print(f"      Canvas: x={cb['x']:.0f} y={cb['y']:.0f} w={cb['w']:.0f} h={cb['h']:.0f}")
+
+        if info.get('diag'):
+            print(f"      [DIAGNOSTIC] Thin vertical elements found:")
+            for d in info['diag']:
+                print(f"        {d['tag']}.{d['className'][:40]} w={d['w']} h={d['h']} left={d['left']:.0f} bg={d['bg']}")
+
+        # 4. Calculate drag coordinates
+        #    x = playhead_x + (target_time - audio.currentTime) * pxPerSec
+        drag_start_x = ph_x + (start_sec - cur_t) * pps
+        drag_end_x   = ph_x + (end_sec - cur_t) * pps
+
+        # Clamp to canvas bounds (with small margin)
+        canvas_left = cb['x']
+        canvas_right = cb['x'] + cb['w']
+        drag_start_x = max(canvas_left + 5, min(drag_start_x, canvas_right - 30))
+        drag_end_x   = max(drag_start_x + 30, min(drag_end_x, canvas_right - 5))
+        
+        # Ensure minimum drag distance
+        if drag_end_x - drag_start_x < 30:
+            drag_end_x = drag_start_x + 100
+
+        drag_y = cb['y'] + cb['h'] * 0.6
+        dist = drag_end_x - drag_start_x
+
+        print(f"      Drag: x={drag_start_x:.0f} -> {drag_end_x:.0f} (dist={dist:.0f}px) y={drag_y:.0f}")
+
+        # 5. Execute physical Playwright drag (slow and deliberate)
+        await page.mouse.move(drag_start_x, drag_y)
+        await page.wait_for_timeout(200)
+        await page.mouse.down()
+        await page.wait_for_timeout(150)
+
+        steps = max(20, int(dist / 5))
+        for s in range(steps):
+            cx = drag_start_x + (dist * (s + 1) / steps)
+            await page.mouse.move(cx, drag_y)
+            await page.wait_for_timeout(25)
+
+        await page.wait_for_timeout(200)
+        await page.mouse.up()
         await page.wait_for_timeout(1000)
 
-        # Handle potential popups blocking the UI
+        # 6. Handle any popup dialogs
         try:
             popup = page.locator('button:has-text("OK"), button:has-text("Yes"), '
                                  'button:has-text("Confirm"), button:has-text("Accept")')
@@ -1148,12 +1291,12 @@ async def _calibrated_drag_first_segment(page, start_sec: float, end_sec: float)
         except Exception:
             pass
 
-        # Verify
+        # 7. Verify
         if await _count_segments(page) > 0:
-            print("      [SUCCESS] First segment spawned via synthetic drag!")
+            print("      [SUCCESS] First segment created via playhead-relative drag!")
             return True
             
-        print("      [FAIL] No segment appeared...")
+        print("      [FAIL] No segment appeared.")
 
     return False
 
