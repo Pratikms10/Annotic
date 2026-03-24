@@ -1199,86 +1199,131 @@ async def _find_playhead_and_pps(page):
 
 async def _calibrated_drag_first_segment(page, start_sec: float, end_sec: float) -> bool:
     """
-    Create the first segment by:
-      1. Seeking audio to t=0 (so playhead is at known position)
-      2. Finding playhead via 4 DOM strategies  
-      3. Computing drag start/end using: x = playhead_x + (t - currentTime) * pxPerSec
-      4. Performing a slow physical Playwright mouse drag
+    Create the first segment by dragging on the waveform canvas.
+    
+    KEY FIX: The canvas is at y~1289 (off-screen). Playwright's 
+    scroll_into_view_if_needed() doesn't work with no_viewport=True.
+    We use JS scrollIntoView({block:'center'}) explicitly, then 
+    re-query coordinates AFTER the scroll completes.
+    
+    We only need a SMALL drag (~150px) to spawn the first row.
+    set_segment_timestamps() will fix precise timing afterward.
     """
     MAX_ATTEMPTS = 3
     
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\n    [ATTEMPT {attempt}/{MAX_ATTEMPTS}] Playhead-relative drag...")
 
-        # 1. Seek to t=0 to put playhead at a known location
+        # 1. Seek to t=0 so playhead is at a known position
         await _seek_audio(page, 0.0)
         await page.wait_for_timeout(600)
 
-        # 2. Scroll canvas into view using Playwright's native method
-        canvas_el = page.locator('canvas').first
-        if await canvas_el.count() == 0:
-            print("      [ERROR] No canvas found!")
+        # 2. FORCE scroll the canvas into the visible browser window via JS
+        #    This is the critical fix — scrollIntoView actually moves the page
+        scrolled = await page.evaluate("""() => {
+            const canvases = Array.from(document.querySelectorAll('canvas'))
+                .filter(c => c.getBoundingClientRect().width > 100);
+            if (!canvases.length) return false;
+            canvases[0].scrollIntoView({ block: 'center', behavior: 'instant' });
+            return true;
+        }""")
+        if not scrolled:
+            print("      [ERROR] No canvas found to scroll!")
             continue
-        await canvas_el.scroll_into_view_if_needed()
-        await page.wait_for_timeout(400)
+        await page.wait_for_timeout(800)
 
-        # 3. Find playhead position and pxPerSec
-        info = await _find_playhead_and_pps(page)
-        
-        if info.get('error'):
-            print(f"      [ERROR] {info['error']}")
+        # 3. Get FRESH bounding box AFTER scroll (coordinates have changed!)
+        box_info = await page.evaluate("""() => {
+            const canvases = Array.from(document.querySelectorAll('canvas'))
+                .filter(c => c.getBoundingClientRect().width > 100);
+            if (!canvases.length) return null;
+            const r = canvases[0].getBoundingClientRect();
+            
+            // Find playhead (wf-cursor)
+            const cursor = document.querySelector('.wf-cursor');
+            let phX = r.left;  // default: left edge of canvas
+            if (cursor) {
+                const cr = cursor.getBoundingClientRect();
+                phX = cr.left + cr.width / 2;
+            }
+            
+            const audio = document.querySelector('audio');
+            const parent = canvases[0].parentElement;
+            const scrollW = parent ? parent.scrollWidth : r.width;
+            const duration = audio ? audio.duration : 0;
+            const pps = duration > 0 ? scrollW / duration : 100;
+            
+            return {
+                x: r.left, y: r.top, w: r.width, h: r.height,
+                phX: phX,
+                pps: pps,
+                currentTime: audio ? audio.currentTime : 0
+            };
+        }""")
+
+        if not box_info:
+            print("      [ERROR] Canvas disappeared after scroll!")
             continue
 
-        ph_x = info['playhead_x']
-        pps = info['px_per_sec']
-        cur_t = info['current_time']
-        cb = info['canvas_box']
-        strategy = info['strategy']
+        cx = box_info['x']
+        cy = box_info['y']
+        cw = box_info['w']
+        ch = box_info['h']
+        ph_x = box_info['phX']
+        pps = box_info['pps']
+        cur_t = box_info['currentTime']
 
-        print(f"      Strategy: {strategy}")
+        print(f"      Canvas AFTER scroll: x={cx:.0f} y={cy:.0f} w={cw:.0f} h={ch:.0f}")
         print(f"      Playhead X: {ph_x:.0f}, PPS: {pps:.1f}, currentTime: {cur_t:.3f}")
-        print(f"      Canvas: x={cb['x']:.0f} y={cb['y']:.0f} w={cb['w']:.0f} h={cb['h']:.0f}")
 
-        if info.get('diag'):
-            print(f"      [DIAGNOSTIC] Thin vertical elements found:")
-            for d in info['diag']:
-                print(f"        {d['tag']}.{d['className'][:40]} w={d['w']} h={d['h']} left={d['left']:.0f} bg={d['bg']}")
-
-        # 4. Calculate drag coordinates
-        #    x = playhead_x + (target_time - audio.currentTime) * pxPerSec
-        drag_start_x = ph_x + (start_sec - cur_t) * pps
-        drag_end_x   = ph_x + (end_sec - cur_t) * pps
-
-        # Clamp to canvas bounds (with small margin)
-        canvas_left = cb['x']
-        canvas_right = cb['x'] + cb['w']
-        drag_start_x = max(canvas_left + 5, min(drag_start_x, canvas_right - 30))
-        drag_end_x   = max(drag_start_x + 30, min(drag_end_x, canvas_right - 5))
+        # 4. Calculate drag coordinates (SMALL drag, ~150px)
+        #    Start at playhead, drag right ~150px just to spawn a row
+        #    set_segment_timestamps will fix the exact timing afterward
+        drag_start_x = ph_x + 5
+        drag_end_x = drag_start_x + 150
         
-        # Ensure minimum drag distance
-        if drag_end_x - drag_start_x < 30:
-            drag_end_x = drag_start_x + 100
-
-        drag_y = cb['y'] + cb['h'] * 0.6
+        # Clamp to visible canvas
+        drag_start_x = max(cx + 5, min(drag_start_x, cx + cw - 160))
+        drag_end_x = min(drag_start_x + 150, cx + cw - 5)
+        drag_y = cy + ch * 0.6
         dist = drag_end_x - drag_start_x
+
+        # Safety: if canvas y is still way off-screen, the scroll didn't work
+        viewport_height = await page.evaluate("() => window.innerHeight")
+        if drag_y < 0 or drag_y > viewport_height:
+            print(f"      [WARN] drag_y={drag_y:.0f} is outside viewport (height={viewport_height})!")
+            print(f"      Attempting window.scrollTo fallback...")
+            await page.evaluate(f"() => window.scrollTo(0, {int(cy - 200)})")
+            await page.wait_for_timeout(500)
+            # Re-query
+            fresh = await page.evaluate("""() => {
+                const c = Array.from(document.querySelectorAll('canvas'))
+                    .filter(c => c.getBoundingClientRect().width > 100)[0];
+                if (!c) return null;
+                const r = c.getBoundingClientRect();
+                return { y: r.top, h: r.height };
+            }""")
+            if fresh:
+                drag_y = fresh['y'] + fresh['h'] * 0.6
+                print(f"      After window.scrollTo: new drag_y={drag_y:.0f}")
 
         print(f"      Drag: x={drag_start_x:.0f} -> {drag_end_x:.0f} (dist={dist:.0f}px) y={drag_y:.0f}")
 
-        # 5. Execute physical Playwright drag (slow and deliberate)
+        # 5. Execute physical Playwright drag (slow and human-like)
         await page.mouse.move(drag_start_x, drag_y)
         await page.wait_for_timeout(200)
         await page.mouse.down()
         await page.wait_for_timeout(150)
 
-        steps = max(20, int(dist / 5))
+        steps = max(15, int(dist / 8))
         for s in range(steps):
-            cx = drag_start_x + (dist * (s + 1) / steps)
-            await page.mouse.move(cx, drag_y)
-            await page.wait_for_timeout(25)
+            px = drag_start_x + (dist * (s + 1) / steps)
+            await page.mouse.move(px, drag_y)
+            await page.wait_for_timeout(30)
 
         await page.wait_for_timeout(200)
         await page.mouse.up()
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(1200)
 
         # 6. Handle any popup dialogs
         try:
@@ -1293,7 +1338,7 @@ async def _calibrated_drag_first_segment(page, start_sec: float, end_sec: float)
 
         # 7. Verify
         if await _count_segments(page) > 0:
-            print("      [SUCCESS] First segment created via playhead-relative drag!")
+            print("      [SUCCESS] First segment created!")
             return True
             
         print("      [FAIL] No segment appeared.")
