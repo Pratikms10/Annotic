@@ -370,16 +370,18 @@ async def _clear_segment_textarea(page, row_index):
 
 async def _calibrated_drag_first_segment(page, container, initial_count, start_sec, end_sec):
     """
-    Create the first segment by finding the playhead via canvas pixel scanning,
-    then dragging from there. No WaveSurfer assumptions.
+    Create the first segment by finding the playhead via SCREENSHOT pixel scan.
+    Uses Playwright screenshot (bypasses CORS canvas taint), sends base64 image
+    back to browser for pixel analysis on a fresh untainted canvas.
     """
+    import base64
     MAX_ATTEMPTS = 2
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\n  [ATTEMPT {attempt}/{MAX_ATTEMPTS}] Creating first segment "
               f"[{start_sec:.3f}s - {end_sec:.3f}s]...")
 
-        # ── Step 1: Wait for waveform canvas ──
+        # ── Step 1: Wait for canvas & scroll into view ──
         try:
             await page.wait_for_selector('canvas', state='visible', timeout=10000)
         except Exception:
@@ -387,189 +389,175 @@ async def _calibrated_drag_first_segment(page, container, initial_count, start_s
             continue
         await page.wait_for_timeout(1500)
 
-        # ── Step 2: Scroll canvas into view & find playhead by scanning pixels ──
-        result = await page.evaluate("""() => {
-            // Find bottom-most large canvas (the waveform)
+        # Scroll canvas into view and get its bounds
+        canvas_info = await page.evaluate("""() => {
             const canvases = Array.from(document.querySelectorAll('canvas'))
                 .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
                 .filter(c => c.rect.width > 100 && c.rect.height > 10)
                 .sort((a, b) => b.rect.top - a.rect.top);
+            if (!canvases.length) return null;
+            canvases[0].el.scrollIntoView({ block: 'center', behavior: 'instant' });
+            return null;  // will re-read after scroll
+        }""")
+        await page.wait_for_timeout(600)
 
-            if (!canvases.length) return { error: 'no_canvas' };
+        # Re-read canvas bounds AFTER scroll completes
+        canvas_info = await page.evaluate("""() => {
+            const canvases = Array.from(document.querySelectorAll('canvas'))
+                .map(c => ({ el: c, rect: c.getBoundingClientRect() }))
+                .filter(c => c.rect.width > 100 && c.rect.height > 10)
+                .sort((a, b) => b.rect.top - a.rect.top);
+            if (!canvases.length) return null;
+            const r = canvases[0].rect;
+            return { top: r.top, left: r.left, width: r.width, height: r.height };
+        }""")
 
-            const main = canvases[0];
-            main.el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        if not canvas_info:
+            print("  [ERROR] No canvas found!")
+            continue
 
-            // Re-read rect after scroll
-            const cRect = main.el.getBoundingClientRect();
-            const canvas = main.el;
-            const pxW = canvas.width;   // internal pixel width
-            const pxH = canvas.height;  // internal pixel height
-            const ratio = cRect.width / pxW;  // CSS px per canvas px
+        cTop = canvas_info['top']
+        cLeft = canvas_info['left']
+        cWidth = canvas_info['width']
+        cHeight = canvas_info['height']
+        print(f"    Canvas after scroll: left={cLeft:.0f} top={cTop:.0f} w={cWidth:.0f} h={cHeight:.0f}")
 
-            let playheadCssX = null;
-            let pxPerSec = 0;
-            let method = 'none';
+        # ── Step 2: Take a Playwright screenshot of the canvas area ──
+        # This bypasses CORS canvas taint — Playwright captures rendered pixels
+        try:
+            screenshot_bytes = await page.screenshot(clip={
+                'x': max(0, cLeft),
+                'y': max(0, cTop),
+                'width': cWidth,
+                'height': cHeight
+            })
+            b64 = base64.b64encode(screenshot_bytes).decode('ascii')
+            print(f"    Screenshot captured: {len(screenshot_bytes)} bytes")
+        except Exception as e:
+            print(f"  [ERROR] Screenshot failed: {e}")
+            continue
 
-            // ── METHOD 1: Scan canvas pixels for the CYAN playhead line ──
-            try {
-                const ctx = canvas.getContext('2d');
-                if (ctx) {
-                    const imgData = ctx.getImageData(0, 0, pxW, pxH);
+        # ── Step 3: Send screenshot to browser & scan for cyan playhead ──
+        # Draw on a fresh un-tainted canvas, scan pixel columns for cyan line
+        scan = await page.evaluate("""(b64Data) => {
+            return new Promise((resolve) => {
+                const img = new Image();
+                img.onload = () => {
+                    const c = document.createElement('canvas');
+                    c.width = img.width;
+                    c.height = img.height;
+                    const ctx = c.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+
+                    const imgData = ctx.getImageData(0, 0, c.width, c.height);
                     const d = imgData.data;
+                    const W = c.width, H = c.height;
 
-                    // Scan each column for CYAN pixels (low R, high G, high B)
-                    // The playhead is a cyan/turquoise vertical line
-                    // Sample the middle 60% of the canvas height (skip ruler at top)
-                    for (let x = 0; x < pxW; x++) {
+                    // ── Find CYAN playhead (R<120, G>140, B>140) ──
+                    let playheadX = -1;
+                    for (let x = 0; x < W; x++) {
                         let cyanCount = 0;
-                        const samples = 12;
+                        const samples = 10;
                         for (let s = 0; s < samples; s++) {
-                            const y = Math.floor(pxH * 0.2 + (pxH * 0.6) * (s / samples));
-                            const i = (y * pxW + x) * 4;
-                            const r = d[i], g = d[i+1], b = d[i+2], a = d[i+3];
-                            // Cyan: R<120, G>150, B>150, and G+B much higher than R
-                            if (r < 120 && g > 140 && b > 140 && (g + b - 2*r) > 100 && a > 100) {
+                            const y = Math.floor(H * 0.15 + H * 0.7 * s / samples);
+                            const i = (y * W + x) * 4;
+                            const r = d[i], g = d[i+1], b = d[i+2];
+                            if (r < 130 && g > 130 && b > 130 &&
+                                (g + b - 2 * r) > 80) {
                                 cyanCount++;
                             }
                         }
-                        if (cyanCount >= 4) {
-                            playheadCssX = cRect.left + x * ratio;
-                            method = 'pixel_scan';
+                        if (cyanCount >= 3) {
+                            playheadX = x;
                             break;
                         }
                     }
 
-                    // ── Also find ruler tick spacing for pxPerSec ──
-                    if (playheadCssX !== null) {
-                        // Scan top 20% of canvas for dark vertical lines (ruler ticks)
-                        const rulerH = Math.floor(pxH * 0.2);
-                        const ticks = [];
-                        for (let x = 0; x < pxW; x++) {
-                            let darkCount = 0;
-                            for (let y = 2; y < rulerH; y += 2) {
-                                const i = (y * pxW + x) * 4;
-                                const brightness = d[i] + d[i+1] + d[i+2];
-                                if (brightness < 350 && d[i+3] > 150) darkCount++;
-                            }
-                            if (darkCount >= rulerH * 0.15) {
-                                if (!ticks.length || x - ticks[ticks.length-1] > 10) {
-                                    ticks.push(x);
-                                }
+                    // ── Find ruler tick marks (dark vertical lines in top 20%) ──
+                    const rulerH = Math.floor(H * 0.2);
+                    const ticks = [];
+                    for (let x = 0; x < W; x++) {
+                        let darkCount = 0;
+                        for (let y = 1; y < rulerH; y += 2) {
+                            const i = (y * W + x) * 4;
+                            const bri = d[i] + d[i+1] + d[i+2];
+                            if (bri < 400 && d[i+3] > 150) darkCount++;
+                        }
+                        if (darkCount >= rulerH * 0.12) {
+                            if (!ticks.length || x - ticks[ticks.length-1] > 10) {
+                                ticks.push(x);
                             }
                         }
+                    }
 
-                        if (ticks.length >= 3) {
-                            // Compute median tick spacing (each tick = 1 second)
-                            const spacings = [];
-                            for (let i = 1; i < ticks.length; i++) {
-                                spacings.push(ticks[i] - ticks[i-1]);
-                            }
-                            spacings.sort((a, b) => a - b);
-                            const median = spacings[Math.floor(spacings.length / 2)];
-                            pxPerSec = median * ratio;
-                            method += '+ticks(' + ticks.length + ',spacing=' + Math.round(median) + ')';
+                    let pxPerSec = 0;
+                    if (ticks.length >= 3) {
+                        const spacings = [];
+                        for (let i = 1; i < ticks.length; i++) {
+                            spacings.push(ticks[i] - ticks[i-1]);
+                        }
+                        spacings.sort((a, b) => a - b);
+                        pxPerSec = spacings[Math.floor(spacings.length / 2)];
+                    }
+
+                    // Also sample a few pixel colors for debugging
+                    const debugPixels = [];
+                    if (playheadX >= 0) {
+                        for (let s = 0; s < 5; s++) {
+                            const y = Math.floor(H * 0.2 + H * 0.6 * s / 5);
+                            const i = (y * W + playheadX) * 4;
+                            debugPixels.push(`(${d[i]},${d[i+1]},${d[i+2]})`);
                         }
                     }
-                }
-            } catch (e) {
-                method = 'pixel_failed:' + e.message;
-            }
 
-            // ── METHOD 2: Find cursor as a thin tall DOM element ──
-            if (playheadCssX === null) {
-                const allEls = document.querySelectorAll('div, span');
-                for (const el of allEls) {
-                    const r = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    if (r.width > 0 && r.width < 6 && r.height > 40 &&
-                        style.position === 'absolute' &&
-                        r.top >= cRect.top - 5 && r.bottom <= cRect.bottom + 5) {
-                        playheadCssX = r.left + r.width / 2;
-                        method = 'dom_thin_element';
-                        break;
-                    }
-                }
-            }
+                    resolve({
+                        playheadX,
+                        pxPerSec,
+                        tickCount: ticks.length,
+                        firstTicks: ticks.slice(0, 8),
+                        imgW: W,
+                        imgH: H,
+                        debugPixels
+                    });
+                };
+                img.onerror = () => resolve({ error: 'image_load_failed' });
+                img.src = 'data:image/png;base64,' + b64Data;
+            });
+        }""", b64)
 
-            // ── METHOD 3: Search by class names ──
-            if (playheadCssX === null) {
-                const selectors = [
-                    '[class*="cursor"]', '[class*="Cursor"]',
-                    '[class*="playhead"]', '[class*="Playhead"]',
-                    '[class*="progress"]', '[class*="Progress"]'
-                ];
-                for (const sel of selectors) {
-                    const els = document.querySelectorAll(sel);
-                    for (const el of els) {
-                        const r = el.getBoundingClientRect();
-                        if (r.height > 20 && r.width < 10 &&
-                            Math.abs(r.top - cRect.top) < 60) {
-                            playheadCssX = r.left + r.width / 2;
-                            method = 'dom_class(' + sel + ')';
-                            break;
-                        }
-                    }
-                    if (playheadCssX !== null) break;
-                }
-            }
-
-            const audio = document.querySelector('audio');
-            const duration = (audio && audio.duration > 0) ? audio.duration : 0;
-
-            return {
-                playheadCssX,
-                pxPerSec,
-                method,
-                canvasTop: cRect.top,
-                canvasLeft: cRect.left,
-                canvasWidth: cRect.width,
-                canvasHeight: cRect.height,
-                internalW: pxW,
-                internalH: pxH,
-                ratio,
-                duration
-            };
-        }""")
-
-        if not result or result.get('error'):
-            print(f"  [ERROR] Probe failed: {result}")
+        if not scan or scan.get('error'):
+            print(f"  [ERROR] Pixel scan failed: {scan}")
             continue
 
-        playhead_x = result['playheadCssX']
-        pps = result['pxPerSec']
-        print(f"    Method: {result['method']}")
-        print(f"    Playhead X: {playhead_x}")
-        print(f"    pxPerSec: {pps:.1f}")
-        print(f"    Canvas: left={result['canvasLeft']:.0f} top={result['canvasTop']:.0f} "
-              f"w={result['canvasWidth']:.0f} h={result['canvasHeight']:.0f}")
-        print(f"    Internal: {result['internalW']}x{result['internalH']} ratio={result['ratio']:.2f}")
+        playhead_px = scan['playheadX']
+        pps = scan['pxPerSec']  # in screenshot pixels (= CSS pixels since clip matches)
+        print(f"    Playhead at screenshot X={playhead_px} "
+              f"(viewport X={cLeft + playhead_px:.0f})" if playhead_px >= 0 else "    Playhead: NOT FOUND")
+        print(f"    pxPerSec: {pps:.1f} | Ticks: {scan['tickCount']} → {scan['firstTicks']}")
+        print(f"    Debug pixels at playhead: {scan['debugPixels']}")
 
-        if playhead_x is None:
-            print("  [ERROR] Could not find playhead (timestamp 0)!")
+        if playhead_px < 0:
+            print("  [ERROR] Could not find cyan playhead in screenshot!")
             continue
 
-        # ── Step 3: Compute drag coordinates ──
-        canvas_left = result['canvasLeft']
-        canvas_width = result['canvasWidth']
-        canvas_top = result['canvasTop']
-        canvas_height = result['canvasHeight']
+        # ── Step 4: Compute drag coordinates ──
+        # playhead_px is in screenshot coords = CSS viewport coords relative to canvas left
+        playhead_viewport_x = cLeft + playhead_px
 
         if pps > 0:
-            # We have px/sec calibration — use it for precise positioning
-            start_x = playhead_x + (start_sec * pps)
-            end_x = playhead_x + (end_sec * pps)
+            start_x = playhead_viewport_x + (start_sec * pps)
+            end_x = playhead_viewport_x + (end_sec * pps)
         else:
-            # No tick calibration — just drag from playhead ~200px right
-            start_x = playhead_x
-            end_x = playhead_x + min(250, canvas_width * 0.15)
+            # No tick calibration — drag from playhead ~200px right
+            start_x = playhead_viewport_x
+            end_x = playhead_viewport_x + min(250, cWidth * 0.15)
 
         # Clamp to canvas bounds
-        start_x = max(canvas_left + 5, min(start_x, canvas_left + canvas_width - 25))
-        end_x = max(start_x + 20, min(end_x, canvas_left + canvas_width - 5))
+        start_x = max(cLeft + 5, min(start_x, cLeft + cWidth - 25))
+        end_x = max(start_x + 20, min(end_x, cLeft + cWidth - 5))
 
-        # Y = lower 70% of canvas (below ruler area at top)
-        y = canvas_top + canvas_height * 0.7
+        # Y = lower 70% of canvas (below ruler at top)
+        y = cTop + cHeight * 0.7
 
         drag_distance = end_x - start_x
         print(f"    Drag: X={start_x:.0f} → {end_x:.0f} (dist={drag_distance:.0f}px) Y={y:.0f}")
@@ -578,7 +566,7 @@ async def _calibrated_drag_first_segment(page, container, initial_count, start_s
             print("  [ERROR] Drag distance too small!")
             continue
 
-        # ── Step 4: Human-like drag ──
+        # ── Step 5: Human-like drag ──
         await page.mouse.move(start_x, y)
         await page.wait_for_timeout(300)
 
@@ -597,7 +585,7 @@ async def _calibrated_drag_first_segment(page, container, initial_count, start_s
         await page.mouse.up()
         print("    Mouse released. Waiting for UI...")
 
-        # ── Step 5: Handle popups ──
+        # ── Step 6: Handle popups ──
         await page.wait_for_timeout(500)
         try:
             popup = page.locator('button:has-text("OK"), button:has-text("Yes"), '
@@ -611,7 +599,7 @@ async def _calibrated_drag_first_segment(page, container, initial_count, start_s
 
         await page.wait_for_timeout(1000)
 
-        # ── Step 6: Verify placeholder appeared ──
+        # ── Step 7: Verify placeholder appeared ──
         new_count = await container.locator('> div').count()
         if new_count <= initial_count:
             print(f"    [FAIL] No new segment! (count={new_count})")
